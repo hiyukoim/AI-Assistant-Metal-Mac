@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import atexit
 import os
 import socket
 import sys
+import time
 import webbrowser
 from threading import Event
 
@@ -12,24 +13,53 @@ from fastapi.responses import RedirectResponse
 
 from AI_Assistant_modules.application_config import ApplicationConfig
 from AI_Assistant_modules.tab_gui import gradio_tab_gui
-from modules import initialize
-from modules import initialize_util
-from modules import timer
-from modules_forge import main_thread
-from modules_forge.initialization import initialize_forge
 from utils.lang_util import LangUtil, get_language_argument
 
-startup_timer = timer.startup_timer
+# Apple Silicon Mac port: replace Forge with a ComfyUI sidecar fronted by
+# a small a1111-compatible HTTP shim. All Forge imports are gated behind
+# IS_MAC because the Forge `modules/` and `modules_forge/` directories
+# do not exist in the Mac install. The Windows code path below is
+# untouched when IS_MAC is False.
+IS_MAC = sys.platform == "darwin"
+
+if IS_MAC:
+    from mac.comfy_shim import register_shim
+
+    class _MacStartupTimer:
+        """Lightweight stand-in for Forge's modules.timer.startup_timer.
+        Records nothing, returns wall-clock since module load on summary().
+        """
+        def __init__(self):
+            self._t0 = time.time()
+
+        def record(self, label):  # noqa: D401 — match Forge's signature
+            return
+
+        def summary(self):
+            return f"{time.time() - self._t0:.1f}s"
+
+    startup_timer = _MacStartupTimer()
+else:
+    from modules import initialize
+    from modules import initialize_util
+    from modules import timer
+    from modules_forge import main_thread
+    from modules_forge.initialization import initialize_forge
+
+    startup_timer = timer.startup_timer
+
 startup_timer.record("launcher")
 
-initialize_forge()
-initialize.imports()
-initialize.check_versions()
-initialize.initialize()
+if not IS_MAC:
+    initialize_forge()
+    initialize.imports()
+    initialize.check_versions()
+    initialize.initialize()
 
 shutdown_event = Event()
 
 def create_api(app):
+    # Forge-only — Mac path uses register_shim() instead.
     from modules.api.api import Api
     from modules.call_queue import queue_lock
 
@@ -80,12 +110,19 @@ async def api_only_worker(shutdown_event: Event):
     async def read_root():
         return RedirectResponse(url=gradio_url)
 
-    initialize_util.setup_middleware(app)
-    api = create_api(app)
+    if IS_MAC:
+        # Mac path: mount the a1111-compatible shim instead of Forge's API.
+        # The shim translates /sdapi/v1/* calls into ComfyUI workflows and
+        # proxies them to the sidecar at 127.0.0.1:8188. For #v4 this is a
+        # no-op stub; #v5 wires up trivial endpoints; #v6 lands img2img.
+        register_shim(app)
+    else:
+        initialize_util.setup_middleware(app)
+        api = create_api(app)
 
-    from modules import script_callbacks
-    script_callbacks.before_ui_callback()
-    script_callbacks.app_started_callback(None, app)
+        from modules import script_callbacks
+        script_callbacks.before_ui_callback()
+        script_callbacks.app_started_callback(None, app)
 
     print(f"Startup time: {startup_timer.summary()}.")
     print(f"Web UI is running at {gradio_url}.")
@@ -113,4 +150,8 @@ def on_exit():
 if __name__ == "__main__":
     atexit.register(on_exit)
     api_only()
-    main_thread.loop()
+    if not IS_MAC:
+        # Forge's UI worker thread keeps the process alive after api_only()
+        # returns. On Mac, uvicorn's server.serve() inside api_only() is
+        # already blocking, so there's nothing else to wait on.
+        main_thread.loop()

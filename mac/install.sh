@@ -67,20 +67,33 @@ uv pip install "torch>=2.6" "torchvision>=0.21" "torchaudio"
 # Pin set tied to gradio 4.44.1 era (HANDOVER.md §3.1).
 # pydantic >=2.10 emits `additionalProperties: True` (bool) which gradio_client's
 # get_type() crashes on. starlette >=0.40 / fastapi >=0.116 changed
-# TemplateResponse signature, breaking gradio 4.44.1.
+# TemplateResponse signature, breaking gradio 4.44.1. huggingface_hub >=0.27
+# removed HfFolder which gradio 4.44.1's oauth.py imports (verified at runtime).
 echo "Installing Gradio + FastAPI pin set ..."
 uv pip install \
     "gradio==4.44.1" \
     "pydantic<2.10" \
     "fastapi==0.115.0" \
-    "starlette==0.38.6"
+    "starlette==0.38.6" \
+    "huggingface_hub<0.26"
 
+# AI_Assistant runtime deps. utils/tagger.py needs cv2 + onnx + onnxruntime;
+# utils/img_utils.py needs scikit-image (rgb2lab, deltaE_ciede2000); the
+# Windows installer pins albumentations + opencv-contrib-python-headless +
+# rich + onnx 1.15 + onnxruntime 1.17 (see AI_Assistant_setup.py
+# packages_to_add). On Mac we let uv resolve current versions of those
+# pure-Python or universally-built packages — opencv-contrib-python-headless
+# has an arm64 wheel, onnx and onnxruntime publish arm64 wheels too.
 echo "Installing AI_Assistant runtime deps ..."
 uv pip install \
     "requests" \
     "Pillow" \
     "numpy" \
-    "onnxruntime"
+    "onnx" \
+    "onnxruntime" \
+    "opencv-contrib-python-headless" \
+    "scikit-image" \
+    "rich"
 # NB: onnxruntime (CPU) only. onnxruntime-gpu has no Apple Silicon build, and
 # CoreMLExecutionProvider tuning is deferred (see issue #v8).
 
