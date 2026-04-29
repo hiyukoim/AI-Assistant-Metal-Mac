@@ -150,4 +150,9 @@ python AI_Assistant.py \
     --nowebui \
     --skip-python-version-check \
     --skip-torch-cuda-test \
+    --exui \
     "$@"
+# --exui : show the LoRA dropdown in tabs that support it (e.g. i2i).
+#         The dropdown appends <lora:NAME:1.0> tokens to the prompt;
+#         the Mac shim parses those into ComfyUI LoraLoader nodes
+#         (see mac/comfy_shim.py _extract_lora_tokens / _build_img2img_workflow).

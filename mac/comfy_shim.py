@@ -42,6 +42,7 @@ import io
 import json
 import os
 import random
+import re
 import time
 import uuid
 from pathlib import Path
@@ -367,6 +368,119 @@ def _save_init_image(b64: str) -> str:
     return fname
 
 
+# --- LoRA token parsing ----------------------------------------------------
+
+# AI_Assistant's exui mode (--exui flag) shows a LoRA dropdown that appends
+# <lora:NAME:WEIGHT> tokens to the positive prompt. a1111 / Forge parse
+# those tokens out and apply them as LoRAs at sample time. ComfyUI uses
+# LoraLoader nodes inserted between the checkpoint and the CLIP/UNet
+# consumers. We mirror that: pull tokens out of the prompt before
+# CLIPTextEncode runs, insert one LoraLoader per token, chain them so each
+# one's outputs feed the next.
+
+# Match <lora:NAME:WEIGHT[:CLIP_WEIGHT]>. NAME may contain dots, dashes,
+# slashes, spaces; WEIGHT is a signed float. CLIP_WEIGHT is optional —
+# when present, it overrides the LoRA's CLIP strength independently of
+# the model strength (a1111 / Forge convention).
+_LORA_TOKEN_RE = re.compile(
+    r"<lora:([^:>]+):(-?\d+(?:\.\d+)?)(?::(-?\d+(?:\.\d+)?))?>",
+    re.IGNORECASE,
+)
+
+
+def _resolve_lora_name(stem_or_alias: str) -> Optional[str]:
+    """Map an alias (no extension) or a filename to a ComfyUI LoraLoader name.
+
+    Match by stem (case-insensitive) so users can write
+    <lora:sdxl_BWLine:0.8> or <lora:sdxl_BWLine.safetensors:0.8> and
+    get the same result.
+    """
+    target = stem_or_alias.strip()
+    target_stem = Path(target).stem.lower()
+    for name in _names_from_node("LoraLoader", "lora_name"):
+        if Path(name).stem.lower() == target_stem:
+            return name
+    return None
+
+
+def _extract_lora_tokens(prompt: str) -> tuple[str, list[dict]]:
+    """Strip <lora:NAME:WEIGHT> tokens from `prompt` and return:
+       (cleaned_prompt, [{name, model_strength, clip_strength}, …]).
+
+    Unresolvable tokens are dropped from the prompt with a warning so
+    the user doesn't get the literal text fed into CLIPTextEncode.
+    """
+    if not prompt or "<lora:" not in prompt.lower():
+        return prompt, []
+
+    units: list[dict] = []
+
+    def _replace(match: re.Match) -> str:
+        raw_name = match.group(1)
+        weight = float(match.group(2))
+        clip_weight = float(match.group(3)) if match.group(3) is not None else weight
+        resolved = _resolve_lora_name(raw_name)
+        if not resolved:
+            print(f"[comfy_shim] LoRA '{raw_name}' not found; dropping token", flush=True)
+            return ""
+        units.append({
+            "name": resolved,
+            "model_strength": weight,
+            "clip_strength": clip_weight,
+        })
+        return ""
+
+    cleaned = _LORA_TOKEN_RE.sub(_replace, prompt)
+    # Collapse the comma+space sequences that often surround the stripped
+    # tokens (e.g. "tag, <lora:x:1>, tag" → "tag, , tag" → "tag, tag").
+    cleaned = re.sub(r",\s*,", ",", cleaned)
+    cleaned = re.sub(r",\s*$", "", cleaned).strip()
+    return cleaned, units
+
+
+def _build_lora_chain(units: list[dict]) -> tuple[list, list, dict]:
+    """Build the LoraLoader chain.
+
+    Returns:
+      model_link  : ["node_id", 0]  — final MODEL output to feed KSampler
+      clip_link   : ["node_id", 1]  — final CLIP output to feed CLIPSetLastLayer
+      nodes       : {node_id: {…}, …} — LoraLoader node definitions
+
+    With no LoRA units, the model_link and clip_link point at the
+    checkpoint loader (node "1") directly and the nodes dict is empty.
+    """
+    if not units:
+        return ["1", 0], ["1", 1], {}
+
+    nodes: dict = {}
+    # Start LoRA node IDs at 100 to leave room for the base (1-9) and
+    # ControlNet (10+) namespaces. ComfyUI accepts any string ID.
+    next_id = 100
+    prev_model: list = ["1", 0]
+    prev_clip: list = ["1", 1]
+    summary: list[str] = []
+
+    for u in units:
+        node_id = str(next_id); next_id += 1
+        nodes[node_id] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model":           prev_model,
+                "clip":            prev_clip,
+                "lora_name":       u["name"],
+                "strength_model":  float(u["model_strength"]),
+                "strength_clip":   float(u["clip_strength"]),
+            },
+        }
+        prev_model = [node_id, 0]
+        prev_clip = [node_id, 1]
+        summary.append(f"{Path(u['name']).stem}@{u['model_strength']:g}")
+
+    if summary:
+        print(f"[comfy_shim] LoRA chain: {' → '.join(summary)}", flush=True)
+    return prev_model, prev_clip, nodes
+
+
 # --- a1111 → ComfyUI preprocessor map --------------------------------------
 
 # AI-Assistant's actions only invoke two preprocessor names (verified by
@@ -418,8 +532,16 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     if "mask" in payload and payload.get("mask"):
         print("[comfy_shim] mask field present in img2img payload; ignored (inpainting deferred)", flush=True)
 
-    prompt = str(payload.get("prompt") or "")
-    negative = str(payload.get("negative_prompt") or "")
+    raw_prompt = str(payload.get("prompt") or "")
+    raw_negative = str(payload.get("negative_prompt") or "")
+
+    # Strip <lora:…> tokens out of both prompts and collect them; the
+    # tokens themselves shouldn't reach CLIPTextEncode. We process
+    # negative-side tokens too in case a tab adds them, even though
+    # AI_Assistant currently only injects LoRAs into the positive prompt.
+    prompt, lora_units_pos = _extract_lora_tokens(raw_prompt)
+    negative, lora_units_neg = _extract_lora_tokens(raw_negative)
+    lora_units = lora_units_pos + lora_units_neg
     steps = int(payload.get("steps") or 20)
     cfg = float(payload.get("cfg_scale") or 7.0)
     denoise = float(payload.get("denoising_strength") or 0.75)
@@ -441,14 +563,23 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     # Base workflow without ControlNet. positive/negative conditioning
     # outputs at "3" and "4" feed KSampler directly. _add_controlnet_units
     # below splices ControlNetApplyAdvanced nodes into that path.
-    workflow: dict = {
+    #
+    # LoRA chain: each <lora:name:weight> token in either prompt becomes a
+    # LoraLoader node. The first LoraLoader takes (model, clip) from the
+    # checkpoint; each subsequent one takes (model, clip) from the prior
+    # LoraLoader. The final outputs feed CLIPSetLastLayer (clip) and
+    # KSampler (model). _used_lora_units captures the chained outputs we
+    # use as `model` and `clip` references below.
+    model_link, clip_link, lora_chain_nodes = _build_lora_chain(lora_units)
+
+    base_nodes: dict = {
         "1": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": ckpt},
         },
         "2": {
             "class_type": "CLIPSetLastLayer",
-            "inputs": {"clip": ["1", 1], "stop_at_clip_layer": clip_last_layer},
+            "inputs": {"clip": clip_link, "stop_at_clip_layer": clip_last_layer},
         },
         "3": {
             "class_type": "CLIPTextEncode",
@@ -468,10 +599,12 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
         },
         # KSampler conditioning links are placeholders ("3", "4"); they
         # get rewritten by _add_controlnet_units when CN is in play.
+        # Model link goes through the LoRA chain (or directly from the
+        # checkpoint when no LoRAs are present).
         "7": {
             "class_type": "KSampler",
             "inputs": {
-                "model":           ["1", 0],
+                "model":           model_link,
                 "positive":        ["3", 0],
                 "negative":        ["4", 0],
                 "latent_image":    ["6", 0],
@@ -492,6 +625,7 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
             "inputs": {"images": ["8", 0], "filename_prefix": "ai_assistant"},
         },
     }
+    workflow: dict = {**base_nodes, **lora_chain_nodes}
 
     # Splice in ControlNet units (if any).
     cn_args = ((payload.get("alwayson_scripts") or {}).get("ControlNet") or {}).get("args") or []
