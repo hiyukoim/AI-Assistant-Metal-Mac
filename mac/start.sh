@@ -17,10 +17,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
+# --- load mac/config.local.env (gitignored, optional) ----------------------
+
+# Sourced before defaults: values here win over defaults but lose to
+# anything already set in the calling shell.
+if [[ -f "$REPO_ROOT/mac/config.local.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/mac/config.local.env"
+    set +a
+fi
+
 # --- defaults --------------------------------------------------------------
 
-: "${AI_ASSISTANT_COMFY_DIR:=/Volumes/Nekochan/Stability Matrix/Data/Packages/ComfyUI}"
-: "${AI_ASSISTANT_MODELS_DIR:=/Volumes/Nekochan/Stability Matrix/Data/Models}"
+: "${AI_ASSISTANT_COMFY_DIR:=$HOME/ComfyUI}"
+: "${AI_ASSISTANT_MODELS_DIR:=$REPO_ROOT/models}"
 : "${AI_ASSISTANT_COMFY_PORT:=8188}"
 : "${AI_ASSISTANT_COMFY_PYTHON:=}"
 
