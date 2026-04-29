@@ -165,10 +165,23 @@ def _save_hash_cache(cache: dict) -> None:
     HASH_CACHE_FILE.write_text(json.dumps(cache, indent=2, sort_keys=True))
 
 
+# Inline-hash files up to this size. Larger files return the cached value
+# if present, otherwise fall back to "00000000" so the dropdown call
+# returns within a sensible HTTP timeout. Bulk hashing of large checkpoints
+# is the v6 problem (lazy/background population on first inference call).
+_INLINE_HASH_MAX_BYTES = 256 * 1024 * 1024  # 256 MB — most LoRAs / small CNs
+
+
 def _hash_short(path: Optional[Path]) -> str:
     """First 8 hex of SHA-256 (a1111 AutoV1 convention).
-    Returns '00000000' if path is None/missing. Caches by abspath+mtime so
-    a 6.5 GB SDXL ckpt is hashed once.
+
+    Returns the cached value if present, computes synchronously for files
+    under _INLINE_HASH_MAX_BYTES, otherwise returns '00000000' to keep
+    /sd-models and /controlnet/model_list responsive (a 6.5 GB SDXL ckpt
+    takes ~30 s to hash on a fast SSD; well over a typical HTTP timeout).
+    Real hashes for large files are populated in #v6 by a background
+    thread kicked off at shim mount time, and cached by abspath+mtime+size
+    so each file is hashed at most once.
     """
     if path is None:
         return "00000000"
@@ -178,8 +191,11 @@ def _hash_short(path: Optional[Path]) -> str:
         return "00000000"
     cache = _load_hash_cache()
     key = f"{path}|{int(st.st_mtime)}|{st.st_size}"
-    if key in cache:
-        return cache[key]
+    cached = cache.get(key)
+    if cached:
+        return cached
+    if st.st_size > _INLINE_HASH_MAX_BYTES:
+        return "00000000"
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
