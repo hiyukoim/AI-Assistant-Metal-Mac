@@ -1,6 +1,15 @@
 /models/
 /venv/
 /.idea/
+/.claude
+
+# Mac port
+/.venv/
+/.DS_Store
+.DS_Store
+/mac/.venv/
+/mac/options.json
+/mac/.hash_cache.json
 
 # WebUI Forge
 /javascript/
