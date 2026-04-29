@@ -91,13 +91,17 @@ uv pip install \
 echo "Installing AI_Assistant runtime deps ..."
 uv pip install \
     "requests" \
-    "Pillow" \
+    "Pillow<10" \
     "numpy" \
     "onnx" \
     "onnxruntime" \
     "opencv-contrib-python-headless" \
     "scikit-image" \
     "rich"
+# NB: Pillow<10 — utils/img_utils.py uses Image.ANTIALIAS which Pillow 10
+# removed (it was renamed to Image.LANCZOS in 9.x as a deprecated alias).
+# Pinning <10 keeps the symbol available without touching the upstream
+# action code (quality firewall).
 # NB: onnxruntime (CPU) only. onnxruntime-gpu has no Apple Silicon build, and
 # CoreMLExecutionProvider tuning is deferred (see issue #v8).
 
