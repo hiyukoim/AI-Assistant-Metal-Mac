@@ -11,6 +11,7 @@
 /mac/options.json
 /mac/.hash_cache.json
 /mac/.comfy.log
+/mac/.start.log
 /mac/config.local.env
 
 # WebUI Forge

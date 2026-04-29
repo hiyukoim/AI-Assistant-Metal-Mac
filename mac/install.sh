@@ -64,18 +64,22 @@ uv pip install "torch>=2.6" "torchvision>=0.21" "torchaudio"
 
 # --- Front-end / API deps --------------------------------------------------
 
-# Pin set tied to gradio 4.44.1 era (HANDOVER.md §3.1).
-# pydantic >=2.10 emits `additionalProperties: True` (bool) which gradio_client's
-# get_type() crashes on. starlette >=0.40 / fastapi >=0.116 changed
-# TemplateResponse signature, breaking gradio 4.44.1. huggingface_hub >=0.27
-# removed HfFolder which gradio 4.44.1's oauth.py imports (verified at runtime).
-echo "Installing Gradio + FastAPI pin set ..."
+# Pin set matching upstream's AI_Assistant_setup.py packages_to_add.
+# The HANDOVER.md §3.1 advice to "bump gradio to 4.44.1" applied to a
+# different upstream (CoppyLora_webUI on gradio 4.3.0). AI_Assistant is
+# on gradio 3.41.2 and its action layer uses gradio-3-only API (e.g.
+# gr.Image(source="upload")) — bumping to 4.44.1 broke the tab layouts
+# at runtime. Sticking to upstream's pins keeps quality firewall intact.
+#
+# huggingface_hub<0.20: gradio_client 0.5.0 (which gradio 3.41.2 pulls
+# in) imports SpaceHardware/SpaceStage from huggingface_hub which works
+# only on hub <0.20 (newer hub moved internals around, breaking the
+# transitive import).
+echo "Installing Gradio + FastAPI pin set (gradio 3.41.2 era) ..."
 uv pip install \
-    "gradio==4.44.1" \
-    "pydantic<2.10" \
-    "fastapi==0.115.0" \
-    "starlette==0.38.6" \
-    "huggingface_hub<0.26"
+    "gradio==3.41.2" \
+    "pydantic==1.10.15" \
+    "huggingface_hub<0.20"
 
 # AI_Assistant runtime deps. utils/tagger.py needs cv2 + onnx + onnxruntime;
 # utils/img_utils.py needs scikit-image (rgb2lab, deltaE_ciede2000); the
