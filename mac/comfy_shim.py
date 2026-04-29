@@ -35,6 +35,7 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -467,6 +468,15 @@ def _poll_history(prompt_id: str, timeout: int = _HISTORY_POLL_TIMEOUT_SEC) -> d
     raise HTTPException(status_code=504, detail=f"Timed out waiting for ComfyUI prompt {prompt_id}")
 
 
+def _run_img2img_blocking(workflow: dict) -> tuple[str, Path]:
+    """Submit + poll + read in a single synchronous chunk so the caller
+    can put the whole thing on a worker thread via asyncio.to_thread.
+    """
+    prompt_id = _submit_workflow(workflow)
+    outputs = _poll_history(prompt_id)
+    return _read_output_image(outputs)
+
+
 def _read_output_image(outputs: dict) -> tuple[str, Path]:
     """Walk a ComfyUI history outputs dict, find the first SaveImage result,
     return (base64_png, abs_path_for_logging).
@@ -602,17 +612,21 @@ def register_shim(app: FastAPI) -> None:
         if not init_images:
             raise HTTPException(status_code=400, detail="init_images is required")
         try:
-            init_filename = _save_init_image(str(init_images[0]))
+            init_filename = await asyncio.to_thread(_save_init_image, str(init_images[0]))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"init_images[0] decode failed: {exc}") from exc
 
         ckpt = _resolve_checkpoint_for_workflow(payload)
         workflow = _build_img2img_workflow(payload, ckpt, init_filename)
 
+        # ComfyUI inference is the slow part — 20 steps of SDXL at ~6 s/it
+        # = ~2 min. Run the entire submit + poll + read pipeline in a
+        # worker thread so the FastAPI event loop stays free to service
+        # other requests (Gradio's WebSocket keepalives, the action's
+        # status polling, etc). Without this the UI's "Connection
+        # errored out" fires before the inference finishes.
         t0 = time.time()
-        prompt_id = _submit_workflow(workflow)
-        outputs = _poll_history(prompt_id)
-        b64, target = _read_output_image(outputs)
+        b64, target = await asyncio.to_thread(_run_img2img_blocking, workflow)
         elapsed = time.time() - t0
         print(f"[comfy_shim] img2img done in {elapsed:.1f}s → {target}", flush=True)
 
