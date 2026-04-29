@@ -1,140 +1,185 @@
 #!/usr/bin/env bash
-# AI-Assistant — ComfyUI sidecar installer for Apple Silicon
-# Clones ComfyUI into $AI_ASSISTANT_COMFY_DIR, installs its requirements
-# into the same .venv created by mac/install.sh, installs the ControlNet
-# preprocessor custom node, and renders extra_model_paths.yaml so
-# ComfyUI sees the user's existing Stability Matrix model tree.
+# AI-Assistant — ComfyUI sidecar verifier for Apple Silicon
+#
+# This script does NOT clone or install ComfyUI. The expected setup is that
+# ComfyUI is already installed and managed by another tool (e.g. Stability
+# Matrix) so the user keeps a single source of truth for ComfyUI updates,
+# custom nodes, and model paths. Stability Matrix even writes the
+# extra_model_paths.yaml we need.
+#
+# This script's job is just to:
+#   1. Confirm the configured ComfyUI dir is real (main.py + a Python venv).
+#   2. Confirm the model categories AI-Assistant needs are mapped in
+#      extra_model_paths.yaml — warn loudly if anything is missing.
+#   3. Confirm comfyui_controlnet_aux is present (used by #v7 lineart
+#      preprocessor mapping). Warn if missing; do NOT install.
+#   4. Create the AI-Assistant-specific Tagger subdirectory under the
+#      models tree so #v3's downloader has somewhere to write.
+#
+# To override the defaults, set the env vars below before running. The same
+# vars are picked up by mac/start.sh, so set them in your shell profile or
+# a wrapper script if you want them to persist.
 
 set -euo pipefail
 
 # --- defaults --------------------------------------------------------------
 
-# ComfyUI lives on internal disk by default — small (~200 MB) and Python
-# imports benefit from internal IO. Override with $AI_ASSISTANT_COMFY_DIR
-# if you keep your Python toolchain on an external SSD.
-: "${AI_ASSISTANT_COMFY_DIR:=$HOME/ComfyUI}"
+# Yuko's setup keeps ComfyUI under Stability Matrix's Packages tree.
+# Stability Matrix manages the version, custom nodes, and venv.
+: "${AI_ASSISTANT_COMFY_DIR:=/Volumes/Nekochan/Stability Matrix/Data/Packages/ComfyUI}"
 
-# Models live on external SSD by default, in the user's existing
-# Stability Matrix tree. AI-Assistant downloads (~15 GB, see
-# mac/download_models.sh) will be added alongside whatever's already
-# there — filenames don't collide.
+# Same Models tree both Stability Matrix and AI-Assistant downloads use.
 : "${AI_ASSISTANT_MODELS_DIR:=/Volumes/Nekochan/Stability Matrix/Data/Models}"
 
-# Pinned ComfyUI commit (master HEAD as of 2026-04-28). Update this when
-# bumping; do not float to master to avoid surprise breakage.
-COMFY_COMMIT="fce0398470fe3ecdb7ab4c5c69555ad0fcbdc09e"
-
-# --- repo root + venv ------------------------------------------------------
+# Optional: explicit Python interpreter for ComfyUI. If unset, the script
+# auto-detects $AI_ASSISTANT_COMFY_DIR/venv/bin/python (Stability Matrix
+# layout). The detected path is not exported because mac/start.sh re-runs
+# the same detection — kept consistent in one place.
+: "${AI_ASSISTANT_COMFY_PYTHON:=}"
 
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-if [[ ! -f .venv/bin/activate ]]; then
-    echo "ERROR: .venv not found. Run ./mac/install.sh first." >&2
-    exit 1
-fi
-
-# shellcheck disable=SC1091
-source .venv/bin/activate
-export VIRTUAL_ENV="$REPO_ROOT/.venv"
-
 echo "AI_ASSISTANT_COMFY_DIR  = $AI_ASSISTANT_COMFY_DIR"
 echo "AI_ASSISTANT_MODELS_DIR = $AI_ASSISTANT_MODELS_DIR"
-echo "ComfyUI commit          = $COMFY_COMMIT"
 echo
 
-# --- clone / update ComfyUI -----------------------------------------------
-
-if [[ -d "$AI_ASSISTANT_COMFY_DIR/.git" ]]; then
-    echo "ComfyUI directory exists; fetching and checking out pinned commit ..."
-    git -C "$AI_ASSISTANT_COMFY_DIR" fetch --quiet origin
-elif [[ -e "$AI_ASSISTANT_COMFY_DIR" ]]; then
-    echo "ERROR: $AI_ASSISTANT_COMFY_DIR exists but isn't a git checkout." >&2
-    echo "       Move it aside or set AI_ASSISTANT_COMFY_DIR elsewhere." >&2
-    exit 1
-else
-    echo "Cloning ComfyUI to $AI_ASSISTANT_COMFY_DIR ..."
-    git clone https://github.com/comfyanonymous/ComfyUI.git "$AI_ASSISTANT_COMFY_DIR"
-fi
-git -C "$AI_ASSISTANT_COMFY_DIR" checkout --quiet "$COMFY_COMMIT"
-
-# --- install ComfyUI requirements into the shared venv --------------------
-
-echo "Installing ComfyUI requirements into the AI-Assistant venv ..."
-uv pip install -r "$AI_ASSISTANT_COMFY_DIR/requirements.txt"
-
-# --- ControlNet preprocessor custom node ----------------------------------
-
-# AI-Assistant's lineart/normalmap/lighting tabs use a1111 preprocessor
-# names like 'lineart_realistic'. The shim (#v7) maps those to nodes
-# from comfyui_controlnet_aux.
-CN_AUX_DIR="$AI_ASSISTANT_COMFY_DIR/custom_nodes/comfyui_controlnet_aux"
-if [[ -d "$CN_AUX_DIR/.git" ]]; then
-    echo "comfyui_controlnet_aux already installed; updating ..."
-    git -C "$CN_AUX_DIR" pull --quiet --ff-only || true
-else
-    echo "Installing comfyui_controlnet_aux ..."
-    git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git "$CN_AUX_DIR" || {
-        echo "WARNING: failed to clone comfyui_controlnet_aux; ControlNet preprocessing will be limited."
-        echo "         (See MAC_SETUP.md troubleshooting for manual install.)"
-    }
-fi
-if [[ -f "$CN_AUX_DIR/requirements.txt" ]]; then
-    uv pip install -r "$CN_AUX_DIR/requirements.txt" || {
-        echo "WARNING: comfyui_controlnet_aux requirements failed; some preprocessors may not work."
-    }
-fi
-
-# --- extra_model_paths.yaml -----------------------------------------------
-
-echo "Rendering extra_model_paths.yaml ..."
-TEMPLATE="$REPO_ROOT/mac/extra_model_paths.yaml.template"
-TARGET="$AI_ASSISTANT_COMFY_DIR/extra_model_paths.yaml"
-
-if [[ ! -f "$TEMPLATE" ]]; then
-    echo "ERROR: $TEMPLATE missing." >&2
-    exit 1
-fi
-
-# Use python rather than sed: $AI_ASSISTANT_MODELS_DIR may contain spaces,
-# slashes, & or other characters that break sed escaping reliably.
-python - "$TEMPLATE" "$TARGET" "$AI_ASSISTANT_MODELS_DIR" <<'PY'
-import sys, pathlib
-src, dst, models_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-text = pathlib.Path(src).read_text()
-pathlib.Path(dst).write_text(text.replace("__MODELS_DIR__", models_dir))
-print(f"  wrote {dst}")
-PY
-
-# --- ensure AI-Assistant-specific subdirs exist ---------------------------
-
-# So ComfyUI doesn't error on startup if a category dir is missing, and so
-# the model downloader (#v3) has somewhere to write.
-for sub in StableDiffusion Lora ControlNet Embeddings Tagger; do
-    mkdir -p "$AI_ASSISTANT_MODELS_DIR/$sub"
-done
-
-# --- final sanity check ----------------------------------------------------
+# --- step 1: ComfyUI install present --------------------------------------
 
 if [[ ! -f "$AI_ASSISTANT_COMFY_DIR/main.py" ]]; then
-    echo "ERROR: ComfyUI install incomplete (no main.py at $AI_ASSISTANT_COMFY_DIR)." >&2
+    cat <<EOF >&2
+ERROR: No ComfyUI install found at:
+       $AI_ASSISTANT_COMFY_DIR
+
+Expected to find $AI_ASSISTANT_COMFY_DIR/main.py.
+
+Either:
+  - Install ComfyUI via Stability Matrix (https://lykos.ai/stability-matrix)
+    and let its default Packages dir handle the install, then re-run
+    this script with the same defaults; or
+  - Clone ComfyUI yourself and re-run with:
+      AI_ASSISTANT_COMFY_DIR=/path/to/your/ComfyUI ./mac/install_comfyui.sh
+EOF
     exit 1
 fi
+
+# Detect the ComfyUI venv Python if not pre-set.
+if [[ -z "$AI_ASSISTANT_COMFY_PYTHON" ]]; then
+    if [[ -x "$AI_ASSISTANT_COMFY_DIR/venv/bin/python" ]]; then
+        AI_ASSISTANT_COMFY_PYTHON="$AI_ASSISTANT_COMFY_DIR/venv/bin/python"
+    elif [[ -x "$AI_ASSISTANT_COMFY_DIR/.venv/bin/python" ]]; then
+        AI_ASSISTANT_COMFY_PYTHON="$AI_ASSISTANT_COMFY_DIR/.venv/bin/python"
+    else
+        cat <<EOF >&2
+ERROR: ComfyUI is at $AI_ASSISTANT_COMFY_DIR but no Python venv was found.
+       Expected one of:
+         $AI_ASSISTANT_COMFY_DIR/venv/bin/python
+         $AI_ASSISTANT_COMFY_DIR/.venv/bin/python
+
+Stability Matrix should create venv/ automatically when you install/launch
+ComfyUI through its UI at least once. If you cloned ComfyUI manually, set
+AI_ASSISTANT_COMFY_PYTHON to your interpreter.
+EOF
+        exit 1
+    fi
+fi
+
+PY_VERSION="$("$AI_ASSISTANT_COMFY_PYTHON" --version 2>&1)"
+echo "ComfyUI Python   : $AI_ASSISTANT_COMFY_PYTHON ($PY_VERSION)"
+
+# --- step 2: extra_model_paths.yaml has what we need ----------------------
+
+YAML="$AI_ASSISTANT_COMFY_DIR/extra_model_paths.yaml"
+if [[ ! -f "$YAML" ]]; then
+    cat <<EOF >&2
+WARNING: $YAML does not exist.
+
+ComfyUI will look for models in its built-in default paths
+($AI_ASSISTANT_COMFY_DIR/models/...) which won't see the AI-Assistant model
+set unless you put them there. Stability Matrix normally writes this file
+the first time you launch ComfyUI through it; do that once if you can.
+
+For now, AI-Assistant features that depend on Lora/ControlNet/checkpoint
+discovery will be empty.
+EOF
+fi
+
+if [[ -f "$YAML" ]]; then
+    REQUIRED_KEYS=(checkpoints loras controlnet embeddings vae)
+    MISSING=()
+    for key in "${REQUIRED_KEYS[@]}"; do
+        # Match either "    key: ..." (indented) or "key: ..." at column 0.
+        if ! grep -qE "^\s+${key}:" "$YAML"; then
+            MISSING+=("$key")
+        fi
+    done
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+        echo
+        echo "WARNING: extra_model_paths.yaml is missing keys: ${MISSING[*]}"
+        echo "         AI-Assistant tabs depending on those will see empty dropdowns."
+        echo "         Add the missing categories pointing into:"
+        echo "           $AI_ASSISTANT_MODELS_DIR/<corresponding subdir>"
+    else
+        echo "ComfyUI YAML     : $YAML (all required keys present)"
+    fi
+fi
+
+# --- step 3: comfyui_controlnet_aux present -------------------------------
+
+CN_AUX="$AI_ASSISTANT_COMFY_DIR/custom_nodes/comfyui_controlnet_aux"
+if [[ -d "$CN_AUX" ]]; then
+    echo "controlnet_aux   : $CN_AUX"
+else
+    cat <<EOF
+WARNING: $CN_AUX is missing.
+
+This custom node provides the lineart_realistic / AnimeLineArt / canny
+preprocessors AI-Assistant relies on (see #v7). Without it, those tabs
+will fall back to passing raw images to ControlNet, which usually
+produces poor results.
+
+To add it via Stability Matrix:
+  Open Stability Matrix → ComfyUI package → Extensions →
+  search "ControlNet Auxiliary" by Fannovel16 → Install.
+
+Or via git, into your existing install:
+  git clone --depth 1 \\
+    https://github.com/Fannovel16/comfyui_controlnet_aux.git \\
+    "$CN_AUX"
+  "$AI_ASSISTANT_COMFY_PYTHON" -m pip install -r "$CN_AUX/requirements.txt"
+EOF
+fi
+
+# --- step 4: AI-Assistant-specific Tagger dir -----------------------------
+
+if [[ ! -d "$AI_ASSISTANT_MODELS_DIR" ]]; then
+    cat <<EOF >&2
+ERROR: AI_ASSISTANT_MODELS_DIR does not exist:
+       $AI_ASSISTANT_MODELS_DIR
+
+Set the env var to your existing models tree, or create the dir.
+EOF
+    exit 1
+fi
+
+mkdir -p "$AI_ASSISTANT_MODELS_DIR/Tagger"
+echo "Tagger dir       : $AI_ASSISTANT_MODELS_DIR/Tagger (ensured)"
 
 cat <<EOF
 
-ComfyUI installed.
+ComfyUI sidecar verified — reusing existing install.
 
-  Path     : $AI_ASSISTANT_COMFY_DIR
-  Commit   : $COMFY_COMMIT
-  Models   : $AI_ASSISTANT_MODELS_DIR
-  YAML     : $AI_ASSISTANT_COMFY_DIR/extra_model_paths.yaml
+  ComfyUI dir    : $AI_ASSISTANT_COMFY_DIR
+  ComfyUI Python : $AI_ASSISTANT_COMFY_PYTHON ($PY_VERSION)
+  Models dir     : $AI_ASSISTANT_MODELS_DIR
+  Tagger dir     : $AI_ASSISTANT_MODELS_DIR/Tagger
 
-Next: ./mac/download_models.sh   (~15 GB AI-Assistant model set; STOPs for confirmation)
+Next: ./mac/download_models.sh   (~15 GB AI-Assistant model set, STOPs for confirmation)
 
 To launch ComfyUI standalone for testing:
 
-  cd "\$AI_ASSISTANT_COMFY_DIR" && python main.py --listen 127.0.0.1 --port 8188 --force-fp32
+  cd "\$AI_ASSISTANT_COMFY_DIR" && \\
+    "\$AI_ASSISTANT_COMFY_PYTHON" main.py --listen 127.0.0.1 --port 8188 --force-fp32
 
 (--force-fp32 because bf16/fp16 mixed precision NaNs on MPS for SDXL.
  See HANDOVER.md §4.2 for the receipts.)
