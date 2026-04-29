@@ -190,6 +190,20 @@ fi
 mkdir -p "$AI_ASSISTANT_MODELS_DIR/Tagger"
 echo "Tagger dir       : $AI_ASSISTANT_MODELS_DIR/Tagger (ensured)"
 
+# AI_Assistant_modules/prompt_analysis.py hardcodes the lookup path
+# 'models/tagger' (lowercase, repo-relative). Rather than touch that
+# file (quality firewall) we link <repo>/models/tagger to the Tagger
+# directory inside the configured models tree. ln -snf is idempotent
+# and replaces a stale symlink if AI_ASSISTANT_MODELS_DIR changes.
+mkdir -p "$REPO_ROOT/models"
+if [[ -e "$REPO_ROOT/models/tagger" && ! -L "$REPO_ROOT/models/tagger" ]]; then
+    echo "WARNING: $REPO_ROOT/models/tagger exists and is not a symlink; leaving it alone."
+    echo "         If prompt analysis fails, remove it and re-run this script."
+else
+    ln -snf "$AI_ASSISTANT_MODELS_DIR/Tagger" "$REPO_ROOT/models/tagger"
+    echo "Tagger symlink   : $REPO_ROOT/models/tagger -> $AI_ASSISTANT_MODELS_DIR/Tagger"
+fi
+
 cat <<EOF
 
 ComfyUI sidecar verified.
