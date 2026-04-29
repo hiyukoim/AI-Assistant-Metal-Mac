@@ -10,6 +10,7 @@
 /mac/.venv/
 /mac/options.json
 /mac/.hash_cache.json
+/mac/.comfy.log
 
 # WebUI Forge
 /javascript/
