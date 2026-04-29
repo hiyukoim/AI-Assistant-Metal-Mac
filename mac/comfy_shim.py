@@ -318,16 +318,56 @@ def _save_init_image(b64: str) -> str:
     return fname
 
 
+# --- a1111 → ComfyUI preprocessor map --------------------------------------
+
+# AI-Assistant's actions only invoke two preprocessor names (verified by
+# grepping AI_Assistant_modules/actions/ + utils/request_api.py). Each
+# entry maps to a (class_type, fixed_inputs) pair; the per-request
+# resolution and image input are wired up in _add_controlnet_units.
+#
+# "None" means "send the raw image to ControlNet without preprocessing"
+# — we just don't insert a preprocessor node.
+_PREPROCESSOR_MAP: dict[str, tuple[str, dict]] = {
+    "lineart_realistic": ("LineArtPreprocessor", {"coarse": "disable"}),
+    "lineart_anime":     ("AnimeLineArtPreprocessor", {}),
+    "canny":             ("CannyEdgePreprocessor", {"low_threshold": 100, "high_threshold": 200}),
+    "openpose":          ("OpenposePreprocessor", {"detect_hand": "enable", "detect_body": "enable", "detect_face": "enable"}),
+    "depth_midas":       ("MiDaS-DepthMapPreprocessor", {}),
+}
+
+
+def _resolve_controlnet_name(field: str) -> Optional[str]:
+    """Map an a1111 ControlNet model field (which carries a [hash8] suffix
+    that may not match our hash) back to a ComfyUI controlnet filename.
+
+    Strategy: drop the hash suffix and match by the leading stem against
+    ComfyUI's known names (case-insensitive, stem-only). The hash on the
+    a1111 side is computed by Forge using a different cached value than
+    what our shim publishes, so matching by name is the only path that
+    works reliably across both sides.
+    """
+    bare = _strip_hash_suffix(field)
+    target_stem = Path(bare).stem.lower()
+    for name in _names_from_node("ControlNetLoader", "control_net_name"):
+        if Path(name).stem.lower() == target_stem:
+            return name
+    return None
+
+
 # --- workflow assembly + submission ----------------------------------------
 
 def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dict:
     """Translate an a1111 /img2img payload to a ComfyUI workflow JSON.
 
-    No ControlNet, no LoRA in #v6 — those land in #v7 and #v8.
-    Mask is logged-and-ignored if present; #v7 wires up inpainting.
+    Supports: prompt, negative_prompt, sampler, steps, cfg, denoise,
+    seed, CLIP_stop_at_last_layers, ControlNet units (single + multi).
+
+    Not yet supported (logged-and-ignored or rejected in caller):
+    - LoRA token parsing inside the prompt (lands in #v8)
+    - mask / inpainting (logged-and-ignored)
     """
     if "mask" in payload and payload.get("mask"):
-        print("[comfy_shim] mask field present in img2img payload; ignored in v6 (lands in v7)", flush=True)
+        print("[comfy_shim] mask field present in img2img payload; ignored (inpainting deferred)", flush=True)
 
     prompt = str(payload.get("prompt") or "")
     negative = str(payload.get("negative_prompt") or "")
@@ -340,45 +380,46 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     except (TypeError, ValueError):
         seed = -1
     if seed < 0:
-        # ComfyUI expects a concrete uint64. Match a1111 behaviour: log
-        # the actual seed used so the user can reproduce a result.
         seed = random.SystemRandom().randint(0, 2**63 - 1)
         print(f"[comfy_shim] seed=-1 → using {seed}", flush=True)
 
     sampler, scheduler = _a1111_sampler_to_comfy(str(payload.get("sampler_name") or "Euler a"))
 
-    # CLIP skip — a1111's CLIP_stop_at_last_layers maps to ComfyUI's
-    # CLIPSetLastLayer which expects a NEGATIVE index (-1 = last layer = a1111 1).
     clip_skip = int((payload.get("override_settings") or {}).get("CLIP_stop_at_last_layers")
                     or _load_options().get("CLIP_stop_at_last_layers", 1))
     clip_last_layer = -max(1, clip_skip)
 
+    # Base workflow without ControlNet. positive/negative conditioning
+    # outputs at "3" and "4" feed KSampler directly. _add_controlnet_units
+    # below splices ControlNetApplyAdvanced nodes into that path.
     workflow: dict = {
-        "1": {  # checkpoint
+        "1": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": ckpt},
         },
-        "2": {  # CLIP skip
+        "2": {
             "class_type": "CLIPSetLastLayer",
             "inputs": {"clip": ["1", 1], "stop_at_clip_layer": clip_last_layer},
         },
-        "3": {  # positive prompt
+        "3": {
             "class_type": "CLIPTextEncode",
             "inputs": {"text": prompt, "clip": ["2", 0]},
         },
-        "4": {  # negative prompt
+        "4": {
             "class_type": "CLIPTextEncode",
             "inputs": {"text": negative, "clip": ["2", 0]},
         },
-        "5": {  # init image
+        "5": {
             "class_type": "LoadImage",
             "inputs": {"image": init_filename},
         },
-        "6": {  # encode init → latent
+        "6": {
             "class_type": "VAEEncode",
             "inputs": {"pixels": ["5", 0], "vae": ["1", 2]},
         },
-        "7": {  # sample
+        # KSampler conditioning links are placeholders ("3", "4"); they
+        # get rewritten by _add_controlnet_units when CN is in play.
+        "7": {
             "class_type": "KSampler",
             "inputs": {
                 "model":           ["1", 0],
@@ -393,34 +434,167 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
                 "denoise":         denoise,
             },
         },
-        "8": {  # decode → pixels
+        "8": {
             "class_type": "VAEDecode",
             "inputs": {"samples": ["7", 0], "vae": ["1", 2]},
         },
-        "9": {  # save (writes to ComfyUI/output/)
+        "9": {
             "class_type": "SaveImage",
             "inputs": {"images": ["8", 0], "filename_prefix": "ai_assistant"},
         },
     }
-    # Stash diagnostic info in a closure scope for the caller's log line.
+
+    # Splice in ControlNet units (if any).
+    cn_args = ((payload.get("alwayson_scripts") or {}).get("ControlNet") or {}).get("args") or []
+    cn_units_used = _add_controlnet_units(workflow, cn_args)
+
     workflow["__a1111__"] = {
         "ckpt": ckpt, "sampler": sampler, "scheduler": scheduler,
         "steps": steps, "cfg": cfg, "denoise": denoise, "seed": seed,
         "clip_last_layer": clip_last_layer,
         "init_filename": init_filename,
+        "cn_units": cn_units_used,
     }
     return workflow
+
+
+def _add_controlnet_units(workflow: dict, cn_args: list) -> list:
+    """Splice ControlNetApplyAdvanced nodes into a base img2img workflow.
+
+    For each enabled CN unit:
+      - Save the unit's input image to ComfyUI/input/ via _save_init_image.
+      - Add a LoadImage node for it.
+      - Optionally chain a preprocessor node (per _PREPROCESSOR_MAP).
+      - Add ControlNetLoader for the named model.
+      - Add ControlNetApplyAdvanced linking the running positive/negative
+        conditioning to the next slot.
+
+    Mutates `workflow` in place. Re-points KSampler's positive/negative
+    inputs to the last unit's output if any unit was added.
+
+    Returns a list of {model, module, weight} dicts for diagnostic logging.
+    """
+    used: list = []
+    if not cn_args:
+        return used
+
+    next_id = 10  # workflow nodes 1..9 are reserved for the base.
+    pos_link: list = ["3", 0]
+    neg_link: list = ["4", 0]
+
+    for idx, unit in enumerate(cn_args):
+        if not unit:
+            continue
+        if not unit.get("enabled", True):
+            continue
+        b64_img = unit.get("image")
+        if not b64_img:
+            continue
+        weight = float(unit.get("weight", 1.0))
+        guidance_start = float(unit.get("guidance_start", 0.0))
+        guidance_end = float(unit.get("guidance_end", 1.0))
+        module = str(unit.get("module") or "None")
+        model_field = str(unit.get("model") or "")
+
+        comfy_cn = _resolve_controlnet_name(model_field)
+        if not comfy_cn:
+            print(f"[comfy_shim] CN unit {idx}: model '{model_field}' not found in ComfyUI; skipping", flush=True)
+            continue
+
+        # 1. save image to ComfyUI/input
+        try:
+            unit_filename = _save_init_image(b64_img)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[comfy_shim] CN unit {idx}: image decode failed: {exc}; skipping", flush=True)
+            continue
+
+        # 2. LoadImage
+        load_id = str(next_id); next_id += 1
+        workflow[load_id] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": unit_filename},
+        }
+        image_link: list = [load_id, 0]
+
+        # 3. preprocessor (optional)
+        if module != "None":
+            mapping = _PREPROCESSOR_MAP.get(module)
+            if mapping:
+                pp_class, pp_extra = mapping
+                pp_id = str(next_id); next_id += 1
+                pp_inputs: dict = {"image": image_link}
+                # 'resolution' is an optional input for most preprocessors;
+                # pass through a1111's processor_res if the node accepts it.
+                node_inputs = _comfy_object_info().get(pp_class, {}).get("input", {}) or {}
+                accepted = set(node_inputs.get("required", {}) or {}) | set(node_inputs.get("optional", {}) or {})
+                if "resolution" in accepted:
+                    pp_inputs["resolution"] = int(unit.get("processor_res", 512))
+                # Filter pp_extra to keys the node actually accepts so a
+                # newer preprocessor variant doesn't 400 on an unknown key.
+                for key, value in pp_extra.items():
+                    if key in accepted:
+                        pp_inputs[key] = value
+                workflow[pp_id] = {"class_type": pp_class, "inputs": pp_inputs}
+                image_link = [pp_id, 0]
+            else:
+                print(f"[comfy_shim] CN unit {idx}: unknown module '{module}', using raw image", flush=True)
+
+        # 4. ControlNetLoader
+        cn_loader_id = str(next_id); next_id += 1
+        workflow[cn_loader_id] = {
+            "class_type": "ControlNetLoader",
+            "inputs": {"control_net_name": comfy_cn},
+        }
+
+        # 5. ControlNetApplyAdvanced
+        apply_id = str(next_id); next_id += 1
+        workflow[apply_id] = {
+            "class_type": "ControlNetApplyAdvanced",
+            "inputs": {
+                "positive":      pos_link,
+                "negative":      neg_link,
+                "control_net":   [cn_loader_id, 0],
+                "image":         image_link,
+                "strength":      weight,
+                "start_percent": guidance_start,
+                "end_percent":   guidance_end,
+            },
+        }
+        pos_link = [apply_id, 0]
+        neg_link = [apply_id, 1]
+
+        used.append({
+            "idx": idx,
+            "model": comfy_cn,
+            "module": module,
+            "weight": weight,
+            "guidance": [guidance_start, guidance_end],
+        })
+
+    if used:
+        # Re-point the KSampler at the chained CN output.
+        workflow["7"]["inputs"]["positive"] = pos_link
+        workflow["7"]["inputs"]["negative"] = neg_link
+    return used
 
 
 def _submit_workflow(workflow: dict) -> str:
     """POST a workflow to ComfyUI's /prompt and return the prompt_id."""
     diag = workflow.pop("__a1111__", {})
     if diag:
+        cn_units = diag.get("cn_units") or []
+        cn_summary = ""
+        if cn_units:
+            cn_summary = " cn=[" + ", ".join(
+                f"#{u['idx']}:{Path(u['model']).stem}({u['module']},w={u['weight']})"
+                for u in cn_units
+            ) + "]"
         print(
             f"[comfy_shim] img2img: ckpt={diag['ckpt']} "
             f"sampler={diag['sampler']}/{diag['scheduler']} "
             f"steps={diag['steps']} cfg={diag['cfg']} denoise={diag['denoise']} "
-            f"seed={diag['seed']} clip_last={diag['clip_last_layer']}",
+            f"seed={diag['seed']} clip_last={diag['clip_last_layer']}"
+            f"{cn_summary}",
             flush=True,
         )
     body = {"prompt": workflow, "client_id": uuid.uuid4().hex}
@@ -596,17 +770,6 @@ def register_shim(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="body must be JSON")
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="body must be a JSON object")
-
-        # ControlNet + LoRA aren't wired yet; reject explicitly so the
-        # action surface knows which features are still pending.
-        cn_args = ((payload.get("alwayson_scripts") or {}).get("ControlNet") or {}).get("args")
-        if cn_args:
-            enabled_units = sum(1 for a in cn_args if a and a.get("enabled", True) and a.get("image"))
-            if enabled_units > 0:
-                raise HTTPException(
-                    status_code=501,
-                    detail=f"ControlNet ({enabled_units} unit(s)) not yet supported on Mac (lands in mac-v7)",
-                )
 
         init_images = payload.get("init_images") or []
         if not init_images:
