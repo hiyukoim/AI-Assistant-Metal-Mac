@@ -51,6 +51,55 @@ import requests
 from fastapi import FastAPI, HTTPException, Request
 from PIL import Image
 
+
+# --- gradio queue timeout patch (must run before .queue().launch()) -------
+
+def _patch_gradio_queue_timeout() -> None:
+    """Make Gradio 3.41's queue tolerate long predicts.
+
+    `gradio/queueing.py` line 80 constructs the queue's internal HTTP
+    client as `httpx.AsyncClient(verify=ssl_verify)` — no timeout
+    argument, which defaults to **5 s read timeout**. The queue worker
+    uses that client to POST to its own /api/predict endpoint (lines
+    374–381) where the user's predict function actually runs. Any
+    predict taking longer than ~5 s raises `httpx.ReadTimeout`, which
+    Gradio catches and surfaces as `process_completed` with
+    `success=False` — the user sees "Error" in the output component
+    while the predict keeps running on the worker thread and saves a
+    correct PNG to disk.
+
+    On Mac/MPS, SDXL inference is 100–500 s. The 5 s timeout makes
+    every generation appear to fail. Patch `Queueing.start` so the
+    httpx client is built with `timeout=None`.
+
+    This patch runs on `mac.comfy_shim` import, which happens in
+    `AI_Assistant_gui.py` before `gradio_tab_gui(...).queue().launch(...)`,
+    so the new start() is in place when uvicorn begins serving.
+    """
+    try:
+        import gradio.queueing as gq
+        import httpx as _httpx
+        from gradio.utils import run_coro_in_background as _run_bg
+
+        async def _patched_start(self, ssl_verify=True):
+            self.queue_client = _httpx.AsyncClient(verify=ssl_verify, timeout=None)
+            _run_bg(self.start_processing)
+            _run_bg(self.start_log_and_progress_updates)
+            if not self.live_updates:
+                _run_bg(self.notify_clients)
+
+        gq.Queue.start = _patched_start
+        print(
+            "[comfy_shim] patched gradio.queueing.Queue.start: queue_client.timeout=None",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the app over the patch
+        print(f"[comfy_shim] gradio queue patch failed (continuing without): {exc}", flush=True)
+
+
+_patch_gradio_queue_timeout()
+
+
 # --- configuration ---------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
