@@ -64,7 +64,7 @@ uv pip install "torch>=2.6" "torchvision>=0.21" "torchaudio"
 
 # --- Front-end / API deps --------------------------------------------------
 
-# Pin set matching upstream's AI_Assistant_setup.py packages_to_add.
+# Pin set matching upstream's legacy_windows/AI_Assistant_setup.py packages_to_add.
 # The HANDOVER.md §3.1 advice to "bump gradio to 4.44.1" applied to a
 # different upstream (CoppyLora_webUI on gradio 4.3.0). AI_Assistant is
 # on gradio 3.41.2 and its action layer uses gradio-3-only API (e.g.
@@ -84,7 +84,7 @@ uv pip install \
 # AI_Assistant runtime deps. utils/tagger.py needs cv2 + onnx + onnxruntime;
 # utils/img_utils.py needs scikit-image (rgb2lab, deltaE_ciede2000); the
 # Windows installer pins albumentations + opencv-contrib-python-headless +
-# rich + onnx 1.15 + onnxruntime 1.17 (see AI_Assistant_setup.py
+# rich + onnx 1.15 + onnxruntime 1.17 (see legacy_windows/AI_Assistant_setup.py
 # packages_to_add). On Mac we let uv resolve current versions of those
 # pure-Python or universally-built packages — opencv-contrib-python-headless
 # has an arm64 wheel, onnx and onnxruntime publish arm64 wheels too.

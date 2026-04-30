@@ -35,10 +35,74 @@ def _open_outputdir(app_config):
     return image_list
 
 
+# Global Cmd-V/Ctrl-V paste handler. Listens at the document level for
+# paste events containing image data, then injects the image into the
+# currently visible <input type=file> in the active Gradio tab. Restores
+# the "paste a screenshot" workflow that worked on the Windows app.
+_PASTE_HANDLER_JS = """
+<script>
+(function () {
+    if (window.__aiAssistantPasteHandler) return;
+    window.__aiAssistantPasteHandler = true;
+
+    document.addEventListener('paste', function (event) {
+        if (!event.clipboardData) return;
+        const items = event.clipboardData.items || [];
+        let imageItem = null;
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].kind === 'file' && items[i].type.startsWith('image/')) {
+                imageItem = items[i];
+                break;
+            }
+        }
+        if (!imageItem) return;
+
+        const file = imageItem.getAsFile();
+        if (!file) return;
+
+        // Find a visible file input that belongs to the active Gradio tab.
+        // Gradio renders gr.Image upload areas with a hidden <input type=file>.
+        // Pick the first input that lives inside an offsetParent (i.e. visible
+        // tab). Skip the mask image if its container also has a normal input.
+        const inputs = Array.from(document.querySelectorAll('input[type=file]'))
+            .filter(function (el) { return el.offsetParent !== null; });
+
+        // If the user has focused a specific upload area (mouseover its
+        // container counts as "active" for our purposes), prefer the closest
+        // input. Otherwise use the first visible one.
+        let target = null;
+        const hovered = document.querySelector('.gradio-container *:hover');
+        if (hovered) {
+            const container = hovered.closest('[data-testid*=\"image\"], .image-container');
+            if (container) {
+                target = container.querySelector('input[type=file]');
+            }
+        }
+        if (!target) target = inputs[0];
+        if (!target) {
+            console.warn('[ai-assistant paste] no visible file input found');
+            return;
+        }
+
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        target.files = dt.files;
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+        console.log('[ai-assistant paste] injected', file.name || 'image', 'into', target);
+        event.preventDefault();
+    });
+})();
+</script>
+"""
+
+
 def gradio_tab_gui(app_config):
     lang_util = app_config.lang_util
 
     with gr.Blocks(title="AI_Assistant") as main_block:
+        # Inject the global paste handler. gr.HTML renders inline; the
+        # <script> runs once on page load.
+        gr.HTML(_PASTE_HANDLER_JS)
         with gr.Tabs() as main_tab:
             with gr.TabItem(lang_util.get_text("img2img")):
                 img_2_img = Img2Img(app_config)

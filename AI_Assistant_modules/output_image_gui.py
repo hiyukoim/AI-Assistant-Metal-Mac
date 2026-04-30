@@ -1,18 +1,29 @@
 import gradio as gr
 
+# Gradio 3.x calls _js as a function expression: the string is treated as
+# the function body, called when the button is clicked. The original named
+# `function copyToClipboard()` only DEFINED the function and never called
+# it — copy silently no-op'd. Use an arrow function so Gradio actually
+# invokes it. Also matches both .output-image (most tabs) and .output_image
+# (the noline cutout tab) class names. Errors are surfaced to the browser
+# console for debugging clipboard permission issues.
 javascript = """
-function copyToClipboard() {
-    var img = Array.from(document.querySelectorAll('.output-image img') || []).filter(img => img.offsetParent)[0];
+() => {
+    const img = Array.from(
+        document.querySelectorAll('.output-image img, .output_image img')
+    ).filter((el) => el.offsetParent)[0];
     if (!img) {
+        console.warn('[ai-assistant clipboard] no visible output image');
         return;
     }
     fetch(img.src)
-    .then(response => response.blob())
-    .then(blob => {
-        const item = new ClipboardItem({ "image/png": blob });
-        navigator.clipboard.write([item]);
-    })
-    .catch(console.error);
+        .then((response) => response.blob())
+        .then((blob) => {
+            const item = new ClipboardItem({ 'image/png': blob });
+            return navigator.clipboard.write([item]);
+        })
+        .then(() => console.log('[ai-assistant clipboard] copied'))
+        .catch((err) => console.error('[ai-assistant clipboard] error:', err));
 }
 """
 

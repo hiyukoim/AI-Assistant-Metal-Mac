@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AI-Assistant — Mac model downloader
 #
-# Bash port of AI_Assistant_model_DL.cmd (Windows). Downloads the 23 files
+# Bash port of legacy_windows/AI_Assistant_model_DL.cmd (Windows). Downloads the 23 files
 # AI-Assistant ships with, verifying SHA-256 hashes (3-retry per file).
 # Idempotent: re-running with all files already present and hash-valid is
 # a no-op.
@@ -12,7 +12,7 @@
 # inference path picks them up automatically.
 #
 # About the hashes: the values below are copied byte-for-byte from
-# AI_Assistant_model_DL.cmd lines 180-202 — do not paraphrase or shorten.
+# legacy_windows/AI_Assistant_model_DL.cmd lines 180-202 — do not paraphrase or shorten.
 # A drift here means a silent download integrity failure.
 #
 # Compatible with Apple's stock /bin/bash 3.2 (no associative arrays).
@@ -41,7 +41,7 @@ fi
 echo "AI_ASSISTANT_MODELS_DIR = $AI_ASSISTANT_MODELS_DIR"
 echo
 
-# --- hash table (mirror of AI_Assistant_model_DL.cmd lines 180-202) -------
+# --- hash table (mirror of legacy_windows/AI_Assistant_model_DL.cmd lines 180-202) -------
 #
 # Plain whitespace-separated table (relative_path SHA256). Looked up via awk
 # so we don't need bash 4 associative arrays.
@@ -150,7 +150,7 @@ download_hf() {
     done
 }
 
-# --- main flow (mirrors AI_Assistant_model_DL.cmd :main, lines 176-275) ---
+# --- main flow (mirrors legacy_windows/AI_Assistant_model_DL.cmd :main, lines 176-275) ---
 
 ANY_FAIL=0
 
