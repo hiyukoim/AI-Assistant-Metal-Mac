@@ -461,6 +461,53 @@ def _cap_render_size(w: int, h: int) -> tuple[int, int]:
     return _SDXL_CANONICAL_SIZES[closest]
 
 
+# --- ESRGAN upscale model selection ---------------------------------------
+
+# Forge upstream renders at the user's full native resolution and uses no
+# upscale model — it relies on CUDA to handle the high-res SDXL pass
+# directly. On Mac that's impossible (MPS cap + fp32-only), so we render
+# at canonical and use a model upscaler to recover detail when the user
+# asked for a larger output.
+#
+# Default: 4x_NMKD-Superscale-SP_178000_G.pth (general-purpose; ships with
+# Yuko's Stability Matrix install). Override per-user via
+# AI_ASSISTANT_UPSCALER in mac/config.local.env. Setting it to an empty
+# string "" disables ESRGAN entirely (falls back to LANCZOS via the
+# action's save_image()). For anime/illustration-specific upscalers, swap
+# in 4x-AnimeSharp.pth or 4x_NMKD-Siax_200k.pth, etc.
+_DEFAULT_UPSCALER = "4x_NMKD-Superscale-SP_178000_G.pth"
+
+
+def _resolve_upscaler() -> Optional[str]:
+    """Return the configured ESRGAN model name (None disables upscale).
+
+    Resolution order:
+      1. AI_ASSISTANT_UPSCALER env var (empty string disables)
+      2. _DEFAULT_UPSCALER if it exists in ComfyUI's known models
+      3. The first available upscale model
+      4. None — fall through to LANCZOS via the action.
+    """
+    raw = os.environ.get("AI_ASSISTANT_UPSCALER")
+    if raw == "":
+        return None
+    candidate = raw or _DEFAULT_UPSCALER
+    available = _names_from_node("UpscaleModelLoader", "model_name")
+    if candidate in available:
+        return candidate
+    # case-insensitive stem match for forgiving config
+    target_stem = Path(candidate).stem.lower()
+    for name in available:
+        if Path(name).stem.lower() == target_stem:
+            return name
+    if available:
+        print(
+            f"[comfy_shim] upscaler {candidate!r} not found; using {available[0]!r}",
+            flush=True,
+        )
+        return available[0]
+    return None
+
+
 # --- LoRA token parsing ----------------------------------------------------
 
 # AI_Assistant's exui mode (--exui flag) shows a LoRA dropdown that appends
@@ -764,6 +811,19 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     # don't OOM at the upper end of the canonical buckets.
     use_tiled_vae = (render_w * render_h) >= _TILED_VAE_PIXELS_THRESHOLD
 
+    # ESRGAN-style upscale: when the cap fired (user asked for a render
+    # larger than canonical), run an upscale model on the decoded image
+    # so the user gets actual detail rather than a LANCZOS blur. Only
+    # engages when the user explicitly wanted a larger output AND an
+    # upscale model is available; otherwise SaveImage gets the
+    # canonical-size decode and the action's save_image() does the
+    # final LANCZOS resize as before.
+    upscale_needed = (
+        payload_w and payload_h
+        and (payload_w * payload_h > render_w * render_h)
+    )
+    upscaler_name = _resolve_upscaler() if upscale_needed else None
+
     # Inpainting: a1111/Forge i2i actions always include a `mask` field in
     # override_payload. Most callers send a pure-white mask which is the
     # "no inpaint" sentinel; only treat this as actual inpainting if at
@@ -891,10 +951,30 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
         },
         "9": {
             "class_type": "SaveImage",
+            # SaveImage source is rewritten below if ESRGAN is in play;
+            # ["8", 0] is the canonical-size VAEDecode output.
             "inputs": {"images": ["8", 0], "filename_prefix": "ai_assistant"},
         },
     }
     workflow: dict = {**base_nodes, **lora_chain_nodes}
+
+    # ESRGAN upscale chain (only when cap fired AND an upscaler is available).
+    # Adds:
+    #   8u  UpscaleModelLoader  → loads e.g. 4x_NMKD-Superscale
+    #   8up ImageUpscaleWithModel(8 → 4× output)
+    # Re-points SaveImage to consume the upscaled output. The action's
+    # save_image() then LANCZOS-tweaks 4× output to the exact target
+    # dim, which is a small delta and mostly preserves detail.
+    if upscaler_name:
+        workflow["8u"] = {
+            "class_type": "UpscaleModelLoader",
+            "inputs": {"model_name": upscaler_name},
+        }
+        workflow["8up"] = {
+            "class_type": "ImageUpscaleWithModel",
+            "inputs": {"upscale_model": ["8u", 0], "image": ["8", 0]},
+        }
+        workflow["9"]["inputs"]["images"] = ["8up", 0]
 
     # Add the inpaint mask loader if needed. LoadImageMask reads a single
     # channel of an arbitrary image as a MASK type (we use the red channel
@@ -917,6 +997,8 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
         "cn_units": cn_units_used,
         "render": (render_w, render_h),
         "tiled_vae": use_tiled_vae,
+        "upscaler": upscaler_name,
+        "inpaint": bool(mask_filename),
     }
     return workflow
 
@@ -1109,13 +1191,17 @@ def _submit_workflow(workflow: dict) -> str:
                 for u in cn_units
             ) + "]"
         render_w, render_h = diag.get("render", (0, 0))
-        tiled = " tiled-vae" if diag.get("tiled_vae") else ""
+        extras = []
+        if diag.get("tiled_vae"):  extras.append("tiled-vae")
+        if diag.get("inpaint"):    extras.append("inpaint")
+        if diag.get("upscaler"):   extras.append(f"upscale={Path(diag['upscaler']).stem}")
+        extras_str = (" " + " ".join(extras)) if extras else ""
         print(
             f"[comfy_shim] img2img: ckpt={diag['ckpt']} "
             f"sampler={diag['sampler']}/{diag['scheduler']} "
             f"steps={diag['steps']} cfg={diag['cfg']} denoise={diag['denoise']} "
             f"seed={diag['seed']} clip_last={diag['clip_last_layer']} "
-            f"render={render_w}x{render_h}{tiled}"
+            f"render={render_w}x{render_h}{extras_str}"
             f"{cn_summary}",
             flush=True,
         )
