@@ -154,6 +154,16 @@ fi
 
 # --- step 3: comfyui_controlnet_aux present -------------------------------
 
+ACN_DIR="$AI_ASSISTANT_COMFY_DIR/custom_nodes/ComfyUI-Advanced-ControlNet"
+if [[ -d "$ACN_DIR/.git" ]]; then
+    echo "Advanced-ControlNet: $ACN_DIR"
+else
+    echo
+    echo "Cloning ComfyUI-Advanced-ControlNet (needed for Forge control_mode parity) ..."
+    git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git "$ACN_DIR" \
+        || echo "WARNING: clone failed; control_mode will fall back to Balanced."
+fi
+
 CN_AUX="$AI_ASSISTANT_COMFY_DIR/custom_nodes/comfyui_controlnet_aux"
 if [[ -d "$CN_AUX" ]]; then
     echo "controlnet_aux   : $CN_AUX"

@@ -162,12 +162,25 @@ def _comfy_object_info() -> dict:
 
 def _names_from_node(node: str, field: str) -> list[str]:
     """Return the list of names ComfyUI exposes for a loader node's input.
-    Returns [] if ComfyUI is unreachable or the node is missing.
+
+    Handles two ComfyUI input schemas:
+      - Older: [["a", "b", "c"], {"default": ...}]   → list at index [0]
+      - Newer: ["COMBO", {"options": ["a", "b", "c"], "multiselect": False}]
+        → list at [1]["options"]
+
+    Returns [] if ComfyUI is unreachable or the node/field is missing.
     """
     info = _comfy_object_info()
     try:
-        choices = info[node]["input"]["required"][field][0]
+        spec = info[node]["input"]["required"][field]
     except (KeyError, IndexError, TypeError):
+        return []
+    # Newer COMBO schema: ["COMBO", {"options": [...]}]
+    if isinstance(spec, list) and len(spec) >= 2 and isinstance(spec[1], dict) and "options" in spec[1]:
+        choices = spec[1]["options"]
+    elif isinstance(spec, list) and spec and isinstance(spec[0], list):
+        choices = spec[0]
+    else:
         return []
     if not isinstance(choices, list):
         return []
@@ -365,6 +378,40 @@ def _save_init_image(b64: str) -> str:
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / fname
     img.save(target, format="PNG")
+    return fname
+
+
+def _save_inpaint_mask(b64: str, render_w: int, render_h: int) -> Optional[str]:
+    """Decode a base64 mask, return a filename if it's a real (non-uniform-white)
+    inpaint mask, or None if it's effectively "no mask" (all white = inpaint
+    everywhere = same as plain img2img). Resizes to (render_w, render_h)
+    so it matches the encoded latent's spatial dim.
+
+    a1111/Forge mask convention: white pixel = inpaint here, black = preserve.
+    Same convention as ComfyUI's VAEEncodeForInpaint, so no inversion.
+    """
+    if not b64:
+        return None
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    try:
+        data = base64.b64decode(b64)
+        mask_img = Image.open(io.BytesIO(data))
+    except Exception:
+        return None
+    if mask_img.mode != "L":
+        mask_img = mask_img.convert("L")
+    # If the minimum pixel value is near 255, the mask is effectively all
+    # white → no inpainting needed, fall through to the plain img2img path.
+    lo, _hi = mask_img.getextrema()
+    if lo >= 250:
+        return None
+    if mask_img.size != (render_w, render_h):
+        mask_img = mask_img.resize((render_w, render_h), Image.LANCZOS)
+    fname = f"ai_assistant_mask_{uuid.uuid4().hex[:12]}.png"
+    target_dir = _comfy_dir() / "input"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    mask_img.save(target_dir / fname, format="PNG")
     return fname
 
 
@@ -569,6 +616,43 @@ def _build_lora_chain(units: list[dict]) -> tuple[list, list, dict]:
     return prev_model, prev_clip, nodes
 
 
+# --- ControlNet control_mode → Advanced-ControlNet weights ---------------
+
+# Forge's `control_mode` per-CN-unit determines how ControlNet conditioning
+# interacts with classifier-free guidance. Standard ComfyUI's
+# ControlNetApplyAdvanced has no equivalent — only `strength`. The
+# Kosinkadink Advanced-ControlNet custom node provides
+# ScaledSoftControlNetWeights with (base_multiplier, uncond_multiplier)
+# that exactly reproduces the three Forge modes.
+#
+# Mapping (verified against Kosinkadink/ComfyUI-Advanced-ControlNet#9, #87):
+#   "Balanced"                     → base=1.0,   uncond=1.0
+#   "My prompt is more important"  → base=0.825, uncond=1.0
+#   "ControlNet is more important" → base=1.0,   uncond=0.0
+#
+# When the Advanced custom node isn't installed, all units fall back to
+# standard ControlNetApplyAdvanced (Balanced equivalent) with a one-time
+# warning so users know what's missing.
+_CONTROL_MODE_WEIGHTS: dict[str, tuple[float, float]] = {
+    "Balanced":                       (1.0,   1.0),
+    "My prompt is more important":    (0.825, 1.0),
+    "ControlNet is more important":   (1.0,   0.0),
+}
+
+
+def _advanced_controlnet_available() -> bool:
+    """True iff Kosinkadink/ComfyUI-Advanced-ControlNet is loaded.
+
+    Probes ComfyUI's /object_info for the three nodes we depend on. Cached
+    via the same TTL as _comfy_object_info() so subsequent calls within a
+    request are free.
+    """
+    info = _comfy_object_info()
+    needed = ("ScaledSoftControlNetWeights", "ControlNetLoaderAdvanced",
+              "ACN_AdvancedControlNetApply_v2")
+    return all(n in info for n in needed)
+
+
 # --- a1111 → ComfyUI preprocessor map --------------------------------------
 
 # AI-Assistant's actions only invoke two preprocessor names (verified by
@@ -617,9 +701,6 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     - LoRA token parsing inside the prompt (lands in #v8)
     - mask / inpainting (logged-and-ignored)
     """
-    if "mask" in payload and payload.get("mask"):
-        print("[comfy_shim] mask field present in img2img payload; ignored (inpainting deferred)", flush=True)
-
     raw_prompt = str(payload.get("prompt") or "")
     raw_negative = str(payload.get("negative_prompt") or "")
 
@@ -683,6 +764,18 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     # don't OOM at the upper end of the canonical buckets.
     use_tiled_vae = (render_w * render_h) >= _TILED_VAE_PIXELS_THRESHOLD
 
+    # Inpainting: a1111/Forge i2i actions always include a `mask` field in
+    # override_payload. Most callers send a pure-white mask which is the
+    # "no inpaint" sentinel; only treat this as actual inpainting if at
+    # least one pixel is darker than 250. _save_inpaint_mask returns None
+    # for the no-op case, otherwise saves the resized mask and returns the
+    # filename for LoadImageMask to consume.
+    mask_b64 = payload.get("mask") or ""
+    mask_filename = _save_inpaint_mask(mask_b64, render_w, render_h) if mask_b64 else None
+    mask_blur = int(payload.get("mask_blur") or 4)
+    if mask_filename:
+        print(f"[comfy_shim] inpainting: mask {mask_filename} grow_mask_by={mask_blur}", flush=True)
+
     # Base workflow without ControlNet. positive/negative conditioning
     # outputs at "3" and "4" feed KSampler directly. _add_controlnet_units
     # below splices ControlNetApplyAdvanced nodes into that path.
@@ -729,21 +822,39 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
                 "crop":           "disabled",
             },
         },
-        "6": {
-            "class_type": "VAEEncodeTiled" if use_tiled_vae else "VAEEncode",
-            "inputs": (
+        "6": (
+            # Inpaint path: load mask, run VAEEncodeForInpaint with the
+            # mask grown by mask_blur pixels (matches a1111 mask_blur).
+            {
+                "class_type": "VAEEncodeForInpaint",
+                "inputs": {
+                    "pixels":         ["5a", 0],
+                    "vae":            ["1", 2],
+                    "mask":           ["6m", 0],
+                    "grow_mask_by":   mask_blur,
+                },
+            }
+            if mask_filename
+            # Standard path: tiled or plain VAE encode.
+            else (
                 {
-                    "pixels":          ["5a", 0],
-                    "vae":             ["1", 2],
-                    "tile_size":       512,
-                    "overlap":         64,
-                    "temporal_size":   64,
-                    "temporal_overlap": 8,
+                    "class_type": "VAEEncodeTiled",
+                    "inputs": {
+                        "pixels":          ["5a", 0],
+                        "vae":             ["1", 2],
+                        "tile_size":       512,
+                        "overlap":         64,
+                        "temporal_size":   64,
+                        "temporal_overlap": 8,
+                    },
                 }
                 if use_tiled_vae
-                else {"pixels": ["5a", 0], "vae": ["1", 2]}
-            ),
-        },
+                else {
+                    "class_type": "VAEEncode",
+                    "inputs": {"pixels": ["5a", 0], "vae": ["1", 2]},
+                }
+            )
+        ),
         # KSampler conditioning links are placeholders ("3", "4"); they
         # get rewritten by _add_controlnet_units when CN is in play.
         # Model link goes through the LoRA chain (or directly from the
@@ -785,9 +896,18 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     }
     workflow: dict = {**base_nodes, **lora_chain_nodes}
 
+    # Add the inpaint mask loader if needed. LoadImageMask reads a single
+    # channel of an arbitrary image as a MASK type (we use the red channel
+    # since _save_inpaint_mask saves a grayscale L PNG — R=G=B).
+    if mask_filename:
+        workflow["6m"] = {
+            "class_type": "LoadImageMask",
+            "inputs": {"image": mask_filename, "channel": "red"},
+        }
+
     # Splice in ControlNet units (if any).
     cn_args = ((payload.get("alwayson_scripts") or {}).get("ControlNet") or {}).get("args") or []
-    cn_units_used = _add_controlnet_units(workflow, cn_args)
+    cn_units_used = _add_controlnet_units(workflow, cn_args, render_w, render_h)
 
     workflow["__a1111__"] = {
         "ckpt": ckpt, "sampler": sampler, "scheduler": scheduler,
@@ -801,25 +921,35 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     return workflow
 
 
-def _add_controlnet_units(workflow: dict, cn_args: list) -> list:
-    """Splice ControlNetApplyAdvanced nodes into a base img2img workflow.
+_ADV_CN_WARNED = {"once": False}
+
+
+def _add_controlnet_units(workflow: dict, cn_args: list, render_w: int, render_h: int) -> list:
+    """Splice ControlNet nodes into a base img2img workflow.
 
     For each enabled CN unit:
-      - Save the unit's input image to ComfyUI/input/ via _save_init_image.
-      - Add a LoadImage node for it.
-      - Optionally chain a preprocessor node (per _PREPROCESSOR_MAP).
-      - Add ControlNetLoader for the named model.
-      - Add ControlNetApplyAdvanced linking the running positive/negative
-        conditioning to the next slot.
+      - Save the unit's input image to ComfyUI/input/.
+      - LoadImage + optional preprocessor + ControlNet loader + apply.
+      - When the unit's `control_mode` ≠ "Balanced" AND Advanced-ControlNet
+        is installed, use the Advanced node chain
+        (ScaledSoftControlNetWeights → ControlNetLoaderAdvanced →
+        ACN_AdvancedControlNetApply_v2) so base/uncond multipliers
+        reproduce Forge's behavior. Otherwise fall back to standard
+        ControlNetApplyAdvanced (Balanced equivalent) with a one-time
+        warning if non-Balanced was requested but Advanced isn't there.
+      - When `pixel_perfect` is true, the preprocessor's `resolution` is
+        forced to max(render_w, render_h) instead of the fixed
+        `processor_res`.
 
     Mutates `workflow` in place. Re-points KSampler's positive/negative
-    inputs to the last unit's output if any unit was added.
-
-    Returns a list of {model, module, weight} dicts for diagnostic logging.
+    inputs to the last unit's output if any unit was added. Returns a
+    diagnostic-summary list.
     """
     used: list = []
     if not cn_args:
         return used
+
+    advanced = _advanced_controlnet_available()
 
     next_id = 10  # workflow nodes 1..9 are reserved for the base.
     pos_link: list = ["3", 0]
@@ -838,6 +968,8 @@ def _add_controlnet_units(workflow: dict, cn_args: list) -> list:
         guidance_end = float(unit.get("guidance_end", 1.0))
         module = str(unit.get("module") or "None")
         model_field = str(unit.get("model") or "")
+        control_mode = str(unit.get("control_mode") or "Balanced")
+        pixel_perfect = bool(unit.get("pixel_perfect"))
 
         comfy_cn = _resolve_controlnet_name(model_field)
         if not comfy_cn:
@@ -866,14 +998,15 @@ def _add_controlnet_units(workflow: dict, cn_args: list) -> list:
                 pp_class, pp_extra = mapping
                 pp_id = str(next_id); next_id += 1
                 pp_inputs: dict = {"image": image_link}
-                # 'resolution' is an optional input for most preprocessors;
-                # pass through a1111's processor_res if the node accepts it.
                 node_inputs = _comfy_object_info().get(pp_class, {}).get("input", {}) or {}
                 accepted = set(node_inputs.get("required", {}) or {}) | set(node_inputs.get("optional", {}) or {})
                 if "resolution" in accepted:
-                    pp_inputs["resolution"] = int(unit.get("processor_res", 512))
-                # Filter pp_extra to keys the node actually accepts so a
-                # newer preprocessor variant doesn't 400 on an unknown key.
+                    if pixel_perfect:
+                        # Forge's pixel_perfect: resize the preprocessor to
+                        # match the rendering resolution, ignoring processor_res.
+                        pp_inputs["resolution"] = int(max(render_w, render_h))
+                    else:
+                        pp_inputs["resolution"] = int(unit.get("processor_res", 512))
                 for key, value in pp_extra.items():
                     if key in accepted:
                         pp_inputs[key] = value
@@ -882,27 +1015,70 @@ def _add_controlnet_units(workflow: dict, cn_args: list) -> list:
             else:
                 print(f"[comfy_shim] CN unit {idx}: unknown module '{module}', using raw image", flush=True)
 
-        # 4. ControlNetLoader
-        cn_loader_id = str(next_id); next_id += 1
-        workflow[cn_loader_id] = {
-            "class_type": "ControlNetLoader",
-            "inputs": {"control_net_name": comfy_cn},
-        }
+        # 4 + 5: control_mode → choose between standard and Advanced ControlNet chain.
+        non_balanced = control_mode in _CONTROL_MODE_WEIGHTS and control_mode != "Balanced"
+        if non_balanced and not advanced:
+            if not _ADV_CN_WARNED["once"]:
+                print(
+                    f"[comfy_shim] CN unit {idx}: control_mode={control_mode!r} requires "
+                    "ComfyUI-Advanced-ControlNet (not installed); falling back to Balanced. "
+                    "Run ./mac/install_comfyui.sh to add it.",
+                    flush=True,
+                )
+                _ADV_CN_WARNED["once"] = True
+            non_balanced = False
 
-        # 5. ControlNetApplyAdvanced
-        apply_id = str(next_id); next_id += 1
-        workflow[apply_id] = {
-            "class_type": "ControlNetApplyAdvanced",
-            "inputs": {
-                "positive":      pos_link,
-                "negative":      neg_link,
-                "control_net":   [cn_loader_id, 0],
-                "image":         image_link,
-                "strength":      weight,
-                "start_percent": guidance_start,
-                "end_percent":   guidance_end,
-            },
-        }
+        if non_balanced:
+            # Advanced-ControlNet path with custom weights.
+            base_mult, uncond_mult = _CONTROL_MODE_WEIGHTS[control_mode]
+            weights_id = str(next_id); next_id += 1
+            workflow[weights_id] = {
+                "class_type": "ScaledSoftControlNetWeights",
+                "inputs": {
+                    "base_multiplier":   base_mult,
+                    "flip_weights":      False,
+                    "uncond_multiplier": uncond_mult,
+                },
+            }
+            cn_loader_id = str(next_id); next_id += 1
+            workflow[cn_loader_id] = {
+                "class_type": "ControlNetLoaderAdvanced",
+                "inputs": {"control_net_name": comfy_cn},
+            }
+            apply_id = str(next_id); next_id += 1
+            workflow[apply_id] = {
+                "class_type": "ACN_AdvancedControlNetApply_v2",
+                "inputs": {
+                    "positive":        pos_link,
+                    "negative":        neg_link,
+                    "control_net":     [cn_loader_id, 0],
+                    "image":           image_link,
+                    "strength":        weight,
+                    "start_percent":   guidance_start,
+                    "end_percent":     guidance_end,
+                    "weights_override": [weights_id, 0],
+                },
+            }
+        else:
+            # Standard path (Balanced).
+            cn_loader_id = str(next_id); next_id += 1
+            workflow[cn_loader_id] = {
+                "class_type": "ControlNetLoader",
+                "inputs": {"control_net_name": comfy_cn},
+            }
+            apply_id = str(next_id); next_id += 1
+            workflow[apply_id] = {
+                "class_type": "ControlNetApplyAdvanced",
+                "inputs": {
+                    "positive":      pos_link,
+                    "negative":      neg_link,
+                    "control_net":   [cn_loader_id, 0],
+                    "image":         image_link,
+                    "strength":      weight,
+                    "start_percent": guidance_start,
+                    "end_percent":   guidance_end,
+                },
+            }
         pos_link = [apply_id, 0]
         neg_link = [apply_id, 1]
 
