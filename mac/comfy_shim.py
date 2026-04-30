@@ -368,6 +368,52 @@ def _save_init_image(b64: str) -> str:
     return fname
 
 
+# --- render-size policy + tiled-VAE thresholds ----------------------------
+
+# SDXL was trained on a fixed set of aspect-ratio buckets ranging from
+# 1024×1024 down to 768×1344 / 1344×768 etc. Rendering outside those
+# buckets degrades quality (model "doesn't know" how to compose at
+# 3500×4669). Plus our M4 Pro 24 GB has a 14 GiB MPS cap, and SDXL fp32
+# UNet activations explode rapidly with resolution — anything above
+# ~1.5M render pixels OOMs.
+#
+# Policy: when payload requests a render larger than _RENDER_MAX_PIXELS,
+# snap to the closest canonical SDXL aspect-ratio bucket. The action's
+# save_image() LANCZOS-upscales the result back to the user's original
+# size, exactly as it does on Windows when Forge renders at canonical
+# and the action upscales after.
+_RENDER_MAX_PIXELS = 1_500_000  # 1280²-ish — safe on 24 GB MPS for fp32 SDXL
+_TILED_VAE_PIXELS_THRESHOLD = 1_400_000  # switch to tiled VAE just under cap
+
+# Mirrors utils/img_utils.py:resize_image_aspect_ratio sizes.
+_SDXL_CANONICAL_SIZES: dict[float, tuple[int, int]] = {
+    1.0:    (1024, 1024),  # square
+    4/3:    (1152, 896),
+    3/2:    (1216, 832),
+    16/9:   (1344, 768),
+    21/9:   (1568, 672),
+    3/1:    (1728, 576),
+    1/4:    (512, 2048),
+    1/3:    (576, 1728),
+    9/16:   (768, 1344),
+    2/3:    (832, 1216),
+    3/4:    (896, 1152),
+}
+
+
+def _cap_render_size(w: int, h: int) -> tuple[int, int]:
+    """If (w, h) exceeds the MPS-safe pixel budget, snap to the closest
+    canonical SDXL aspect bucket. Otherwise return (w, h) unchanged.
+    """
+    if w <= 0 or h <= 0:
+        return 1024, 1024
+    if w * h <= _RENDER_MAX_PIXELS:
+        return w, h
+    aspect = w / h
+    closest = min(_SDXL_CANONICAL_SIZES.keys(), key=lambda x: abs(x - aspect))
+    return _SDXL_CANONICAL_SIZES[closest]
+
+
 # --- LoRA token parsing ----------------------------------------------------
 
 # AI_Assistant's exui mode (--exui flag) shows a LoRA dropdown that appends
@@ -436,6 +482,48 @@ def _extract_lora_tokens(prompt: str) -> tuple[str, list[dict]]:
     cleaned = re.sub(r",\s*,", ",", cleaned)
     cleaned = re.sub(r",\s*$", "", cleaned).strip()
     return cleaned, units
+
+
+# --- fast-LoRA detection (Hyper-SDXL, LCM, Lightning, Turbo) --------------
+
+# Pattern → (extract_steps_from_match_or_default, default_cfg_or_None)
+# `default_cfg_or_None`: if not None, override CFG when this LoRA is detected.
+# CFG-aware variants (Hyper-SDXL-*-CFG-*) keep the user's CFG value.
+_FAST_LORA_RULES: list[tuple] = [
+    # Hyper-SDXL CFG variant — already trained for normal CFG, keep user's CFG.
+    (re.compile(r"hyper-sd(?:xl)?-(\d+)steps?-cfg", re.I),  "match", None),
+    # Hyper-SDXL non-CFG variant — needs cfg≈1.
+    (re.compile(r"hyper-sd(?:xl)?-(\d+)steps?", re.I),       "match", 1.0),
+    # SDXL Lightning — N-step variants.
+    (re.compile(r"lightning-(\d+)step", re.I),                "match", 1.0),
+    # LCM — typically 4 steps, cfg=1.
+    (re.compile(r"\blcm[-_]", re.I),                          4,        1.0),
+    (re.compile(r"_lcm\b", re.I),                              4,        1.0),
+    # SDXL Turbo — 1–4 steps, cfg=1.
+    (re.compile(r"turbo", re.I),                               4,        1.0),
+]
+
+
+def _detect_fast_lora(units: list[dict]) -> Optional[tuple[int, Optional[float]]]:
+    """Inspect LoRA names; if a fast-sampling LoRA is in use, return
+    (override_steps, override_cfg_or_None_to_keep_user_value).
+    Returns None if no fast LoRA matched.
+    """
+    for u in units:
+        stem = Path(u["name"]).stem
+        for regex, steps_rule, cfg in _FAST_LORA_RULES:
+            m = regex.search(stem)
+            if not m:
+                continue
+            if steps_rule == "match":
+                try:
+                    steps = int(m.group(1))
+                except (IndexError, ValueError):
+                    continue
+            else:
+                steps = int(steps_rule)
+            return (steps, cfg)
+    return None
 
 
 def _build_lora_chain(units: list[dict]) -> tuple[list, list, dict]:
@@ -542,8 +630,22 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     prompt, lora_units_pos = _extract_lora_tokens(raw_prompt)
     negative, lora_units_neg = _extract_lora_tokens(raw_negative)
     lora_units = lora_units_pos + lora_units_neg
+
+    # Auto-tune steps/cfg when a fast-sampling LoRA is in the chain.
+    # Hyper-SDXL-8steps reduces 20→8 steps (≈2.5× speedup on M4); LCM and
+    # Lightning are similar. Done before reading payload so user-provided
+    # values still win if they pass --no-fast-lora-override (future).
+    fast_override = _detect_fast_lora(lora_units)
     steps = int(payload.get("steps") or 20)
     cfg = float(payload.get("cfg_scale") or 7.0)
+    if fast_override is not None:
+        new_steps, new_cfg = fast_override
+        if new_steps and new_steps != steps:
+            print(f"[comfy_shim] fast-LoRA detected: steps {steps} → {new_steps}", flush=True)
+            steps = new_steps
+        if new_cfg is not None and abs(new_cfg - cfg) > 1e-3:
+            print(f"[comfy_shim] fast-LoRA detected: cfg {cfg} → {new_cfg}", flush=True)
+            cfg = new_cfg
     denoise = float(payload.get("denoising_strength") or 0.75)
     seed_in = payload.get("seed", -1)
     try:
@@ -559,6 +661,27 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
     clip_skip = int((payload.get("override_settings") or {}).get("CLIP_stop_at_last_layers")
                     or _load_options().get("CLIP_stop_at_last_layers", 1))
     clip_last_layer = -max(1, clip_skip)
+
+    # Decide render dimensions. AI_Assistant's action layer normally
+    # passes payload (width, height) = base_pil.size which is already
+    # canonical SDXL. But the upscale path (request_api.upscale_and_save_images)
+    # passes the original full-res input dimensions (e.g. 3500×4669) and
+    # expects Forge's hires-fix machinery to handle it. On Mac we cap
+    # the render at the closest canonical aspect bucket; the action's
+    # save_image() LANCZOS-upscales the result back up afterwards.
+    payload_w = int(payload.get("width") or 0)
+    payload_h = int(payload.get("height") or 0)
+    render_w, render_h = _cap_render_size(payload_w, payload_h)
+    if (render_w, render_h) != (payload_w, payload_h) and payload_w and payload_h:
+        print(
+            f"[comfy_shim] capping render: {payload_w}×{payload_h} → "
+            f"{render_w}×{render_h} (MPS budget; saved file LANCZOS-upscaled by action)",
+            flush=True,
+        )
+
+    # Switch to tiled VAE near or above the budget so VAE encode/decode
+    # don't OOM at the upper end of the canonical buckets.
+    use_tiled_vae = (render_w * render_h) >= _TILED_VAE_PIXELS_THRESHOLD
 
     # Base workflow without ControlNet. positive/negative conditioning
     # outputs at "3" and "4" feed KSampler directly. _add_controlnet_units
@@ -593,9 +716,33 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
             "class_type": "LoadImage",
             "inputs": {"image": init_filename},
         },
+        # 5a: ImageScale — resize the loaded image to render_w × render_h.
+        # Always present (cheap when sizes match) so VAEEncode below has
+        # a stable "5a" input link regardless of init image size.
+        "5a": {
+            "class_type": "ImageScale",
+            "inputs": {
+                "image":          ["5", 0],
+                "upscale_method": "lanczos",
+                "width":          render_w,
+                "height":         render_h,
+                "crop":           "disabled",
+            },
+        },
         "6": {
-            "class_type": "VAEEncode",
-            "inputs": {"pixels": ["5", 0], "vae": ["1", 2]},
+            "class_type": "VAEEncodeTiled" if use_tiled_vae else "VAEEncode",
+            "inputs": (
+                {
+                    "pixels":          ["5a", 0],
+                    "vae":             ["1", 2],
+                    "tile_size":       512,
+                    "overlap":         64,
+                    "temporal_size":   64,
+                    "temporal_overlap": 8,
+                }
+                if use_tiled_vae
+                else {"pixels": ["5a", 0], "vae": ["1", 2]}
+            ),
         },
         # KSampler conditioning links are placeholders ("3", "4"); they
         # get rewritten by _add_controlnet_units when CN is in play.
@@ -617,8 +764,19 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
             },
         },
         "8": {
-            "class_type": "VAEDecode",
-            "inputs": {"samples": ["7", 0], "vae": ["1", 2]},
+            "class_type": "VAEDecodeTiled" if use_tiled_vae else "VAEDecode",
+            "inputs": (
+                {
+                    "samples":          ["7", 0],
+                    "vae":              ["1", 2],
+                    "tile_size":        512,
+                    "overlap":          64,
+                    "temporal_size":    64,
+                    "temporal_overlap": 8,
+                }
+                if use_tiled_vae
+                else {"samples": ["7", 0], "vae": ["1", 2]}
+            ),
         },
         "9": {
             "class_type": "SaveImage",
@@ -637,6 +795,8 @@ def _build_img2img_workflow(payload: dict, ckpt: str, init_filename: str) -> dic
         "clip_last_layer": clip_last_layer,
         "init_filename": init_filename,
         "cn_units": cn_units_used,
+        "render": (render_w, render_h),
+        "tiled_vae": use_tiled_vae,
     }
     return workflow
 
@@ -772,11 +932,14 @@ def _submit_workflow(workflow: dict) -> str:
                 f"#{u['idx']}:{Path(u['model']).stem}({u['module']},w={u['weight']})"
                 for u in cn_units
             ) + "]"
+        render_w, render_h = diag.get("render", (0, 0))
+        tiled = " tiled-vae" if diag.get("tiled_vae") else ""
         print(
             f"[comfy_shim] img2img: ckpt={diag['ckpt']} "
             f"sampler={diag['sampler']}/{diag['scheduler']} "
             f"steps={diag['steps']} cfg={diag['cfg']} denoise={diag['denoise']} "
-            f"seed={diag['seed']} clip_last={diag['clip_last_layer']}"
+            f"seed={diag['seed']} clip_last={diag['clip_last_layer']} "
+            f"render={render_w}x{render_h}{tiled}"
             f"{cn_summary}",
             flush=True,
         )
