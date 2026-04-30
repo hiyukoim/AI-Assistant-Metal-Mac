@@ -1,61 +1,76 @@
-[日本語](README.md) | [EN](README_en.md) | [中文](README_zh_CN.md)
-# AI-Assistant
-[stable-diffusion-webui-forge](https://github.com/lllyasviel/stable-diffusion-webui-forge/tree/main) をバックエンドに組み込んだ、お絵描き補助AIのGUIアプリです。
-![01](https://github.com/tori29umai0123/AI-Assistant/assets/1675141/07ea96a5-d9d0-4b87-a8f6-ba41b4680f33)
+# AI-Assistant for Apple Silicon Mac
 
-# 起動方法
-## exeファイル
-exeファイルをそのままダブルクリックで起動できます。
+Apple Silicon Mac (M-series) port of [`tori29umai0123/AI-Assistant`](https://github.com/tori29umai0123/AI-Assistant), an SDXL drawing-assistance Gradio app with 10 specialised tabs (img2img, lineart, normal map, lighting, anime shadow, colour scheme, coloring, resize, etc.).
 
-以下の引数を指定することで、起動時の言語を指定できます。
-```
-AI_Assistant.exe --lang=jp
-AI_Assistant.exe --lang=en
-AI_Assistant.exe --lang=zh_CN
-```
-さらに引数を追加することで、Stable Diffusion Web UIに対するオプションを追加できます(上級者向け)
-デフォルトではこのように指定されています。
-AI_Assistant.exe --lang=ja --nowebui --xformers --skip-python-version-check --skip-torch-cuda-test --skip-torch-cuda-test
+This fork replaces the embedded `stable-diffusion-webui-forge` backend with a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) sidecar fronted by a small a1111-API-compatible HTTP shim. The 10 original Gradio tabs and the action layer that drives them are preserved verbatim, so the user-facing workflow matches the Windows app.
 
-また、以下の引数を追加することで拡張UIを表示できます（現在、i2iタブでLoRAを読み込めるようになりました）
-```
---exui
-```
-## わかっている人向け
-以下のようなbatファイルを実行することで、引数を簡単に指定できます。<br>
-AI_Assistant_exUI.bat
-```
-@echo off
-start /d "%~dp0" AI_Assistant.exe --nowebui --xformers --skip-python-version-check --skip-torch-cuda-test --exui
+## Setup
+
+See **[MAC_SETUP.md](MAC_SETUP.md)** for the full install + run + troubleshooting guide.
+
+Three commands:
+
+```bash
+./mac/install.sh           # Python 3.10.11 venv + deps
+./mac/install_comfyui.sh   # ComfyUI sidecar verifier (or auto-clone if you don't have ComfyUI yet)
+./mac/download_models.sh   # ~12 GB AI-Assistant model set
+./mac/start.sh             # launches both processes + opens the UI
 ```
 
-低VRAMの場合は以下のようなbatファイルを作成してください。
+## Highlights
+
+- **Native MPS inference.** No CUDA emulation, no Rosetta. fp32 on Apple Silicon GPU because bf16 NaNs on MPS for SDXL.
+- **Hyper-SDXL / LCM / Lightning auto-detect.** Add `<lora:Hyper-SDXL-8steps-CFG-lora:1.0>` to your prompt and the shim auto-overrides steps to 8 — ~2.5× faster generation with no UI changes.
+- **Full Forge → ComfyUI translation.** 22-entry sampler map; ControlNet `control_mode` parity (Balanced / My prompt is more important / ControlNet is more important) via [Kosinkadink/ComfyUI-Advanced-ControlNet](https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet); `pixel_perfect` honoured; LoRA dynamic loading via prompt tokens.
+- **Inpainting works.** White-mask sentinel detection, `VAEEncodeForInpaint` with `grow_mask_by` from the `mask_blur` payload field.
+- **ESRGAN upscale on the resize tab.** Defaults to `4x_NMKD-Superscale-SP_178000_G.pth`; overridable via `AI_ASSISTANT_UPSCALER`.
+- **Gradio queue patched.** The 5 s `httpx` read timeout buried in `gradio/queueing.py:80` that turned every long Mac inference into a phantom "Error" is monkey-patched at shim mount time.
+- **Reuses your existing ComfyUI install** if you have one (e.g. via [Stability Matrix](https://lykos.ai/stability-matrix)) — no duplicate downloads.
+
+## What runs where
+
 ```
-@echo off
-start /d "%~dp0" AI_Assistant.exe --nowebui --xformers --skip-python-version-check --skip-torch-cuda-test --unet-in-fp8-e4m3fn
+[Browser]
+   │
+   ▼
+[Gradio UI on :7860]   ◄── AI_Assistant Python 3.10 in <repo>/.venv
+   │
+   │ unchanged action layer calls /sdapi/v1/...
+   ▼
+[FastAPI on :7861]    ◄── mac/comfy_shim.py mounts a1111-compatible endpoints
+   │
+   │ translates payloads to ComfyUI workflow JSON
+   ▼
+[ComfyUI on :8188]    ◄── ComfyUI Python 3.12 in $AI_ASSISTANT_COMFY_DIR/venv
+   │
+   ▼
+[MPS / Apple Silicon]
 ```
 
-## 開発者向け
-ビルド設定を行った上で、`AI_Assistant.bat`を実行するか、`.venv\Scripts\python.exe AI_Assistant.py`を実行してください。
+The two Python venvs are independent (Python 3.10 for the front-end, 3.12 for ComfyUI). They communicate over HTTP only.
 
-# ビルド設定（開発者向け）
-Python 3.10.x、uv、CUDA 12.8で開発されています。
-webui-forgeのライブラリを使用しているため、ビルド時にはバージョンを合わせた上で以下の手順が必要です。
+## Performance — M4 Pro 24 GB
 
-## 前提条件
-- [uv](https://docs.astral.sh/uv/) (未インストールの場合、install.ps1が自動でインストールします)
-- [CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive)
+| Configuration | Time |
+|---|---|
+| First inference (Metal compile + 6 GB SDXL load) | +30–60 s one-off |
+| i2i 20 steps, no ControlNet | ~150–200 s |
+| i2i 20 steps + 1 ControlNet | ~200–250 s |
+| **+ Hyper-SDXL 8-step LoRA** | **~50–80 s** |
+| Resize tab (canonical render + 4× ESRGAN) | +5 s |
 
-## 環境構築
-AI_Assistant_install.ps1を実行してインストール
+Subsequent generations on the same checkpoint reuse the loaded weights — much faster than the first run.
 
-## セキュリティソフトの除外設定
-セキュリティーソフトの設定で、フォルダと実行ファイル名を除外リストに追加する。<br>
-例：Windows Defenderの場合、Windows セキュリティ→ウイルスと脅威の防止→ウイルスと脅威の防止の設定→設定の管理→除外<br>
-AI_Assistant.exe(プロセス)<br>
-C:\AI_Assistant（フォルダ）<br>
-のように指定する。
+## Out of scope
 
-## 実行ファイル生成
-build.cmdを実行してください。specファイルに基づいてPyInstallerビルドとファイルコピーが自動で行われます。
-ビルド成果物は`dist\AI_Assistant\`に出力されます。
+- bf16 / fp16 mixed precision (NaN on MPS for SDXL — verified)
+- PyInstaller `.app` bundling
+- Bitwise output parity with the Windows app (different sampler kernels and precision; impossible by construction)
+
+## License
+
+[AGPL-3.0](LICENSE.txt), inherited from upstream.
+
+## Upstream
+
+This is a Mac-only fork. For the Windows / CUDA / Forge version, see [`tori29umai0123/AI-Assistant`](https://github.com/tori29umai0123/AI-Assistant).
